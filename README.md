@@ -257,3 +257,38 @@ bo'limi yuqorida, xuddi shu Upstash/Neon/GitHub mexanizmi ishlatiladi).
   bunday holatda animatsiya `TABRIK_BUSINESS_CHAT_NOT_ELIGIBLE` logi
   bilan to'xtaydi, foydalanuvchiga aniq sabab ko'rsatiladi, hech qachon
   botning shaxsiy chatiga yashirincha redirect qilinmaydi.
+
+
+## 🎮🎥 1v1 O'yinlar — Shaxmat va Rus shashkasi
+
+Istalgan 1:1 Telegram chatida `@Student_ai_uz_bot game` yozilsa, ikkita
+o'yin chiqadi: **♟ Shaxmat** va **⚪ Rus shashkasi**. Tanlangan o'yin chatga
+1v1 xona tugmasi bilan joylanadi. Ikkala foydalanuvchi tugmani bosib bir xil
+Mini App xonasiga kiradi, **Oq/Qora** tomonini va dona ko'rinishini
+(**Klassik/Kristall/Neon**) tanlaydi.
+
+- Shaxmat yurishlari serverda tekshiriladi: shohga shax, rokada, en passant,
+  piyodani avtomatik farzin qilish, mat/pat va 50-yurish durangi hisobga olinadi.
+- Rus shashkasida urish majburiy, oddiy toshlar orqaga ham uradi, damka
+  diagonal bo'ylab uzoqqa yuradi.
+- O'yin holati qayta ishlashlar orasida persistent saqlashga yuboriladi
+  (Upstash/Neon/GitHub sozlangan bo'lsa restartdan keyin ham qayta tiklanadi).
+- Harakat, urish va yakun animatsiyalari bor; lokal ovoz effektlari mavjud.
+- Mini App ichida WebRTC **kamera + mikrofon** mavjud. Qattiq NAT/operator
+  tarmoqlarida barqarorlik uchun `GAME_TURN_URL`, `GAME_TURN_USERNAME`,
+  `GAME_TURN_CREDENTIAL` sozlamalarini berish mumkin.
+
+### O'yin Mini App'ini yoqish
+
+BotFather'da bot uchun **Main Mini App** URL sifatida:
+`https://YOUR-RENDER-DOMAIN.onrender.com/miniapp/`
+qo'yiladi. Mavjud root router `startapp=game_<ROOM_ID>` ni avtomatik ravishda
+`/miniapp/game/` ga olib o'tadi.
+
+## 🎬 Kino storage architecture
+
+Kino now supports an optional Cloudflare R2/S3-compatible media layer. New admin uploads are still accepted by Telegram and their `file_id` is retained as a fallback, but when R2 credentials are configured the bot imports the movie once into R2. The Mini App then receives a direct R2/CDN URL or a short-lived presigned URL, so Render does not proxy the video bytes for normal playback.
+
+Required Render variables for R2: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`. For a CDN/public custom domain set `R2_PUBLIC_BASE_URL`; otherwise leave it empty and the backend creates a short-lived presigned URL.
+
+Existing catalog movies without `r2_key` continue to use the Telegram/Render fallback until they are re-uploaded or migrated.

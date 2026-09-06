@@ -130,6 +130,9 @@ import tabrik_business
 import video_tools
 import inline_media
 import webapp_security
+import movie_watch
+import game
+import drawing_game
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +244,12 @@ QOSHIQ_BARE_RE = re.compile(r"^/(?:qo[`'\u00b4\u2018\u2019\u02bb\u02bc]shiq|qosh
 QOSHIQ_WITH_QUERY_RE = re.compile(r"^/(?:qo[`'\u00b4\u2018\u2019\u02bb\u02bc]shiq|qoshiq)(?:@\w+)?\s+(.+)$", re.IGNORECASE)
 
 TABRIK_BARE_RE = re.compile(r"^/tabrik(?:@\w+)?\s*$", re.IGNORECASE)
+# 🎬 /kino — inline katalog: "kino" barcha kinolarni, "kino ajdar uyi"
+# nom bo'yicha katalogdan qidiradi.
+KINO_RE = re.compile(r"^kino(?:\s+(.+))?$", re.IGNORECASE)
+# 🎮 GAME — 1v1 shaxmat / rus shashkasi. "@Student_ai_uz_bot game"
+# yozilganda aynan shu ikki o'yin ro'yxati chiqadi.
+GAME_RE = re.compile(r"^game$", re.IGNORECASE)
 
 # 🎨 /rasim — ATAYLAB bo'sh query'ni ham qabul qiladi: do'st bilan chatda
 # shunchaki "@Student_ai_uz_bot" deb yozib to'xtash eng qulay/tabiiy
@@ -319,6 +328,93 @@ async def on_inline_query(
 
     cache = context.bot_data.setdefault("inline_queries", {})
     _trim_cache(cache)
+
+    # --------------------------------------------------------
+    # 🎮 1v1 O'YIN — "@Student_ai_uz_bot game"
+    # Ikki natija chiqadi. Natijani chatga joylashtirganda xona allaqachon
+    # yaratilgan bo'ladi; tugma shu xonani Direct Mini App sifatida ochadi.
+    # Server barcha yurishlarni qayta tekshiradi.
+    # --------------------------------------------------------
+    if GAME_RE.match(query):
+        if not PUBLIC_BASE_URL:
+            await _answer_redirect(update, query, "PUBLIC_BASE_URL sozlanmagan — O'yin Mini App ochilmaydi")
+            return
+        results=[]
+        for gkey,title,desc,emoji in [
+            ("chess","♟ Shaxmat","2 kishi • oq/qora • klassik yurish qoidalari","♟"),
+            ("checkers","⚪ Rus shashkasi","2 kishi • majburiy urish • damka","⚪"),
+        ]:
+            rid=game.create_room(gkey,user.id)
+            if not rid:
+                continue
+            url=game.room_url(gkey,rid)
+            results.append(InlineQueryResultArticle(
+                id=f"game_{gkey}_{uuid.uuid4().hex}",
+                title=title,
+                description=desc,
+                input_message_content=InputTextMessageContent(
+                    f"{emoji} {title}\n\n"
+                    "👥 1v1 o'yin xonasi tayyor.\n"
+                    "👇 Ikkalangiz ham tugmani bosib Mini App'ga kiring va rang tanlang."
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎮 O‘yinni boshlash", url=url)
+                ]]),
+            ))
+        if not results:
+            await _answer_instruction(update,"🎮 O'yin hozircha mavjud emas","Server sozlamasini tekshiring.",query=query)
+            return
+        await update.inline_query.answer(results,cache_time=0,is_personal=True)
+        _log_inline(user,query,"queued","1v1 game ro'yxati ko'rsatildi")
+        return
+
+    # --------------------------------------------------------
+    # 🎬 KINO — oldindan yuklangan katalogdan inline qidiruv.
+    # Natija chatga tushgach, "▶️ Birga ko'rish" tugmasi orqali
+    # ikki kishilik Watch Party Mini App ochiladi.
+    # --------------------------------------------------------
+    kino_match = KINO_RE.match(query)
+    if kino_match:
+        search_text = (kino_match.group(1) or "").strip()
+        if not PUBLIC_BASE_URL:
+            await _answer_redirect(update, query, "PUBLIC_BASE_URL sozlanmagan — Kino Mini App ochilmaydi")
+            return
+
+        movies = storage.search_movies(search_text)
+        if not movies:
+            await _answer_instruction(
+                update,
+                "🎬 Kino topilmadi",
+                f"«{search_text}» bo'yicha katalogda kino yo'q." if search_text else "Katalog hali bo'sh. Admin /kino orqali kino yuklashi mumkin.",
+                query=query,
+            )
+            return
+
+        results = []
+        for movie in movies[:10]:
+            room_id = movie_watch.find_or_create_room(movie["id"], user.id)
+            if not room_id:
+                continue
+            url = movie_watch.room_url(movie["id"], room_id)
+            result_id = "kino_" + uuid.uuid4().hex
+            results.append(
+                InlineQueryResultArticle(
+                    id=result_id,
+                    title=f"🎬 {movie['title'][:80]}",
+                    description="👥 2 kishi • ▶️ Birga tomosha qilish",
+                    input_message_content=InputTextMessageContent(
+                        f"🎬 {movie['title']}\n\n"
+                        "👥 Birga tomosha qilish xonasi tayyor.\n"
+                        "👇 Ikkalangiz ham «Birga ko'rish»ni bosing.",
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("▶️ Birga ko'rish", url=url)
+                    ]]),
+                )
+            )
+        await update.inline_query.answer(results, cache_time=3, is_personal=True)
+        _log_inline(user, query, "queued", f"/kino katalog natijalari={len(results)}")
+        return
 
     # --------------------------------------------------------
     # 🎬 OG'IR: /vid
@@ -717,28 +813,44 @@ async def _answer_instruction(update: Update, title: str, description: str, quer
 
 
 async def _answer_rasim(update: Update) -> None:
-    """/rasim (yoki bo'sh mention) — natijalar ro'yxati o'RNIGA, alohida
-    "🎨 Rasm chizish" TUGMASINI ko'rsatadi (qarang: fayl boshidagi E oqim
-    izohi). Bu tugma Mini App'ni ochadi; Mini App'dan qaytish
-    bot.py > _handle_rasim_upload_inline orqali `answer_web_app_query`
-    bilan yakunlanadi — shu funksiya faqat tugmani ko'rsatishga javobgar."""
+    """🎨 Rasm chizish 1v1 o'yini uchun inline natija.
+
+    Natija chatga joylashtiriladi va ikkala tomon aynan shu xabardagi
+    bitta tugma orqali bir xil Direct Mini App xonasiga kiradi.
+    """
     if not PUBLIC_BASE_URL:
         await _answer_redirect(update, "/rasim")
         return
 
     user_id = update.inline_query.from_user.id
-    rid = webapp_security.create_inline_request(user_id)
-    webapp_url = f"{PUBLIC_BASE_URL}/miniapp/rasim/?rid={rid}"
+    rid = drawing_game.create_room(user_id)
+    try:
+        url = drawing_game.room_url(rid)
+    except ValueError as e:
+        logger.error("🎨 /rasim: Direct Mini App URL yaratilmadi: %s", e, exc_info=True)
+        await _answer_redirect(update, "/rasim")
+        return
 
-    await update.inline_query.answer(
-        [],
-        button=InlineQueryResultsButton(
-            text="🎨 Rasm chizish",
-            web_app=WebAppInfo(url=webapp_url),
+    result = InlineQueryResultArticle(
+        id=f"draw_{rid}",
+        title="🎨 Rasm chizish — 1v1",
+        description="👥 Do'stingiz bilan bir xil topshiriqni chizing • AI hakam baholaydi",
+        input_message_content=InputTextMessageContent(
+            "🎨 Rasm chizish — 1v1\n\n"
+            "👥 Ikkingizga ham bir xil topshiriq beriladi.\n"
+            "✏️ Har kim o'z rasmini alohida chizadi.\n"
+            "🏆 Ikkala rasm yuborilgach AI hakam natijani chiqaradi."
         ),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎨 Rasm chizishni boshlash", url=url)
+        ]]),
+    )
+    await update.inline_query.answer(
+        [result],
         cache_time=0,
         is_personal=True,
     )
+    _log_inline(user, "/rasim", "queued", f"1v1 drawing room={rid}")
 
 
 def _trim_cache(cache: dict):
@@ -760,6 +872,32 @@ async def on_chosen_inline_result(
     chosen = update.chosen_inline_result
 
     inline_message_id = chosen.inline_message_id
+
+    # 🎬 /kino natijalari faqat Watch Party Mini App uchun mo'ljallangan.
+    # Tanlangan kino hech qachon Universal AI oqimiga tushmasligi kerak.
+    # Kesh server restartidan keyin yo'qolgan bo'lsa ham `chosen.query`
+    # orqali bu maxsus oqimni aniqlab, shu yerning o'zida to'xtatamiz.
+    special_query = (chosen.query or "").strip()
+    # 🎮 GAME ham og'ir/AI oqim emas: natija tanlanganda AI chaqirilmasin.
+    # Cache restart bo'lsa ham query/result_id orqali aniqlanadi.
+    if chosen.result_id.startswith("game_") or re.match(r"^game(?:\s+|$)", special_query, re.IGNORECASE):
+        logger.info(
+            "🎮 [CHOSEN_INLINE] /game natijasi tanlandi — AI'ga YUBORILMAYDI "
+            "(user_id=%s, query=%r, result_id=%s)",
+            getattr(chosen.from_user, "id", "?"), special_query[:120], chosen.result_id,
+        )
+        return
+
+    if chosen.result_id.startswith("kino_") or re.match(r"^kino(?:\s+|$)", special_query, re.IGNORECASE):
+        logger.info(
+            "🎬 [CHOSEN_INLINE] /kino natijasi tanlandi — AI'ga YUBORILMAYDI "
+            "(user_id=%s, query=%r, result_id=%s)",
+            getattr(chosen.from_user, "id", "?"), special_query[:120], chosen.result_id,
+        )
+        # Kino natijasi xabar sifatida yuborilgach, uning ichidagi
+        # "▶️ Birga ko'rish" direct Mini App tugmasi ishlaydi. Bu yerda
+        # hech qanday edit/AI chaqiruvi kerak emas.
+        return
 
     cache = context.bot_data.get("inline_queries", {})
     entry = cache.pop(chosen.result_id, None)
@@ -837,8 +975,6 @@ async def on_chosen_inline_result(
     # (kesh yo'qolib qolsa) uchun ham AYNAN shu xato takrorlanardi. Shu
     # sabab BARCHA maxsus buyruqlar bu yerda ANIQ to'xtatiladi — hech
     # qachon AI'ga yuborilmaydi:
-    special_query = chosen.query or ""
-
     if re.match(r"^/tabrik(?:@\w+)?(\s|$)", special_query, re.IGNORECASE):
         logger.info(
             f"🎁 [CHOSEN_INLINE] /tabrik natijasi tanlandi — AI'ga YUBORILMAYDI "

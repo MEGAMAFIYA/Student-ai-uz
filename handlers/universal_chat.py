@@ -35,6 +35,7 @@ from handlers.vid import vid_cmd
 from handlers.qoshiq import qoshiq_cmd
 from handlers.pro_tabrik import pro_cmd
 from handlers.my_cabinet import my_cabinet_cmd, on_personal_key_text
+from handlers.kino import kino_entry
 import pending_input
 import storage
 
@@ -75,6 +76,7 @@ SPECIAL_COMMAND_HANDLERS = {
     "qoshiq": qoshiq_cmd,
     "pro": pro_cmd,
     "my": my_cabinet_cmd,
+    "kino": kino_entry,
 }
 
 
@@ -93,6 +95,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     is_group = chat.type in ("group", "supergroup")
     user_text = update.message.text.strip()
+
+    # 🎮 Inline game trigger/result hech qachon Universal/Dase AI'ga yuborilmaydi.
+    # Ayrim Telegram klientlari inline natijani oddiy Message sifatida qayta
+    # ko'rsatishi mumkin; shu sababli aynan "@Student_ai_uz_bot game" ham
+    # xavfsiz ravishda AI oqimidan chiqariladi.
+    game_text = re.sub(r"@student_ai_uz_bot", "", user_text, flags=re.IGNORECASE).strip().lower()
+    if game_text in {"game", "game@student_ai_uz_bot"} or game_text.startswith("game "):
+        logger.info("🎮 game xabari Universal/Dase AI oqimidan o'tkazilmadi: chat_id=%s", chat.id)
+        return
+
+    # 🎬 Inline Kino Watch Party xabarlari Universal AIga yuborilmaydi.
+    # Bu himoya Telegram klienti inline natijani oddiy Message update sifatida
+    # qaytargan holatda ham AI javobining oldini oladi.
+    if user_text.startswith("🎬 ") and "Birga tomosha qilish xonasi tayyor" in user_text:
+        logger.info("🎬 Kino Watch Party xabari AI oqimidan o'tkazilmadi: chat_id=%s", chat.id)
+        return
+
+    # 🎮 GAME inline natijasi chatga joylashtirilganda Telegram ayrim klientlarda
+    # uni oddiy TEXT update sifatida ham ko'rsatishi mumkin. Bunday xabar hech
+    # qachon Universal AI'ga yuborilmaydi. Himoya bir nechta formatni qamrab oladi.
+    normalized_game = user_text.lower().replace("’", "'").replace("‘", "'")
+    is_game_result = (
+        ("1v1 o'yin xonasi tayyor" in normalized_game and
+         ("♟ shaxmat" in normalized_game or "⚪ rus shashkasi" in normalized_game))
+        or normalized_game.strip() in {"♟ shaxmat", "⚪ rus shashkasi"}
+        or normalized_game.startswith("🎮 o'yinni boshlash")
+    )
+    if is_game_result:
+        logger.info("🎮 Game xonasi xabari AI oqimidan o'tkazilmadi: chat_id=%s", chat.id)
+        return
 
     # 🔑 AVVAL HAMMASIDAN OLDIN: foydalanuvchi "/my > 🔑 Shaxsiy
     # kalitlarim"da kalit/model matnini kiritishini kutayotganmi? Bo'lsa,

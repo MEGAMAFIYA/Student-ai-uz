@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import base64
+import re
 import httpx
 from dotenv import load_dotenv
 
@@ -64,6 +65,40 @@ GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # ============================================================
+# 🎬 /kino — kino katalogi + Mini App
+# ============================================================
+# Telegram Cloud Bot API orqali qabul qilinadigan kino hajmi uchun xavfsiz
+# limit. Fayl Telegramdagi file_id bilan saqlanadi, shuning uchun kino
+# qayta yuklanmaydi.
+KINO_MAX_UPLOAD_MB = int(os.getenv("KINO_MAX_UPLOAD_MB", "20"))
+KINO_ROOM_TTL_SEC = int(os.getenv("KINO_ROOM_TTL_SEC", str(6 * 60 * 60)))
+# Ixtiyoriy: BotFather > Mini App uchun short name. Bo'sh bo'lsa Main Mini App ishlatiladi.
+KINO_APP_SHORT_NAME = os.getenv("KINO_APP_SHORT_NAME", "").strip()
+# Ixtiyoriy WebRTC TURN. STUN ko‘p tarmoqlarda yetarli, lekin mobil/operator NAT
+# holatlarida TURN relay kerak bo‘lishi mumkin.
+KINO_TURN_URL = os.getenv("KINO_TURN_URL", "").strip()
+# Bir nechta TURN URL ni vergul yoki yangi qatorda berish mumkin.
+# Masalan Metered bergan UDP/TCP/TLS URL'larini shu yerga qo'shish mumkin.
+KINO_TURN_URLS = tuple(dict.fromkeys(
+    x.strip() for x in re.split(r"[,\n]+", os.getenv("KINO_TURN_URLS", KINO_TURN_URL)) if x.strip()
+))
+KINO_TURN_USERNAME = os.getenv("KINO_TURN_USERNAME", "").strip()
+KINO_TURN_CREDENTIAL = os.getenv("KINO_TURN_CREDENTIAL", "").strip()
+
+# ☁️ Cloudflare R2 / S3-compatible Kino storage. Optional; when disabled,
+# Kino falls back to the existing Telegram -> Render runtime cache.
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")
+R2_PRESIGNED_TTL_SEC = max(60, min(3600, int(os.getenv("R2_PRESIGNED_TTL_SEC", "900"))))
+GAME_TURN_URL = os.getenv("GAME_TURN_URL", "").strip()
+GAME_TURN_USERNAME = os.getenv("GAME_TURN_USERNAME", "").strip()
+GAME_TURN_CREDENTIAL = os.getenv("GAME_TURN_CREDENTIAL", "").strip()
+
+
+# ============================================================
 # 🤖 Bot mention orqali kelgan buyruqlarni aniqlash uchun username.
 # ============================================================
 # Ishga tushganda bot.py (_post_init) `application.bot.get_me()` orqali
@@ -72,6 +107,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 # o'sha so'rov biror sababga ko'ra muvaffaqiyatsiz bo'lsa ishlatiladigan
 # zaxira (fallback) qiymat.
 BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME", "Student_ai_uz_bot").lstrip("@")
+DRAWING_APP_SHORT_NAME = os.getenv("DRAWING_APP_SHORT_NAME", "rasim").strip().strip("/")
 
 # ============================================================
 # 🎬 /vid — video yuklab olish (yt-dlp)
@@ -667,7 +703,10 @@ def _github_put_content(path: str, content_bytes: bytes, message: str, max_attem
     url = _github_contents_url(path)
     encoded_content = base64.b64encode(content_bytes).decode("ascii")
 
-    for attempt in range(1, max_attempts + 1):
+    import random
+    import time
+    effective_attempts = max(6, max_attempts)
+    for attempt in range(1, effective_attempts + 1):
         sha = _github_get_sha(url)
         body = {
             "message": message,
@@ -680,10 +719,13 @@ def _github_put_content(path: str, content_bytes: bytes, message: str, max_attem
             with httpx.Client(timeout=30.0) as client:
                 r = client.put(url, headers=_github_headers(), json=body)
             if r.status_code == 409:
+                delay = min(0.25 * (2 ** min(attempt - 1, 4)), 4.0) + random.uniform(0.05, 0.25)
                 logger.warning(
-                    f"⚠️ GitHub 409 Conflict ('{path}') — SHA eskirgan bo'lishi mumkin "
-                    f"(parallel yozuv). Qayta urinilmoqda ({attempt}/{max_attempts})..."
+                    f"⚠️ GitHub 409 Conflict ('{path}') — SHA eskirgan yoki parallel yozuv bor. "
+                    f"Yangi SHA olinib {delay:.2f}s dan keyin qayta uriniladi "
+                    f"({attempt}/{effective_attempts})..."
                 )
+                time.sleep(delay)
                 continue
             r.raise_for_status()
             return True
@@ -698,7 +740,7 @@ def _github_put_content(path: str, content_bytes: bytes, message: str, max_attem
             return False
 
     logger.error(
-        f"❌ GitHub'ga '{path}' yozib bo'lmadi — {max_attempts} urinishdan keyin ham "
+        f"❌ GitHub'ga '{path}' yozib bo'lmadi — {effective_attempts} urinishdan keyin ham "
         "409 Conflict davom etmoqda (SHA doimo eskirib qolmoqda, ehtimol bir nechta "
         "so'rov juda tez-tez yozmoqda)."
     )

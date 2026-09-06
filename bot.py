@@ -16,8 +16,9 @@ import re
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from threading import Thread, Timer
+from urllib.parse import urlparse, parse_qs
 
 import telegram.error
 from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats, BotCommandScopeChat, InlineQueryResultPhoto
@@ -42,11 +43,14 @@ import wallet
 import payment_providers
 import webapp_security
 import inline_media
+import movie_watch
+import game
+import drawing_game
 from handlers import (
     menu, universal_chat, course_work, translate as translate_handler, images_to_pdf,
     edit_pdf, guide, inline_query, developer, pptx_gen, essay, quiz, solve, summarize,
     grammar, citation, my_files, reminders, voice, wallet_ui, tabrik, rasim,
-    vid, qoshiq, mention_dispatch, pro_tabrik, my_cabinet,
+    vid, qoshiq, kino, mention_dispatch, pro_tabrik, my_cabinet,
 )
 from pdf_tools import make_pdf
 
@@ -73,6 +77,7 @@ BOT_COMMANDS = [
     # bermaydi, shuning uchun shu yerda ASCII "qoshiq" ko'rsatiladi — lekin
     # "/qo'shiq" (apostrof bilan) ham xuddi shunday ishlaydi (handlers/qoshiq.py).
     BotCommand("qoshiq", "🎵 Qo'shiq qidirish va yuborish"),
+    BotCommand("kino", "🎬 Kino katalogi"),
     BotCommand("pro", "💎 Shaxsiy rasmli tabriknoma (Pro)"),
     BotCommand("my", "👤 Mening kabinetim"),
     BotCommand("yoqish", "Guruhda Universal chatni yoqish"),
@@ -98,6 +103,7 @@ async def _post_init(application):
         me = await application.bot.get_me()
         if me and me.username:
             mention_dispatch.set_bot_username(me.username)
+            drawing_game.set_bot_username(me.username)
     except Exception as e:
         logger.warning(f"🧭 Bot username'ni get_me() orqali olishda xato (fallback ishlatiladi): {e}")
 
@@ -118,6 +124,24 @@ async def _post_init(application):
         reminders.reschedule_all(application)
     except Exception as e:
         logger.error(f"⏰ Eslatmalarni qayta rejalashtirishda xato: {type(e).__name__}: {e}", exc_info=True)
+
+
+async def _on_business_message(update, context):
+    """📨 Connected Business account chatidagi incoming xabarni qayd etadi.
+
+    Telegram Business `can_reply` huquqi aynan oxirgi 24 soatda incoming
+    xabar bo'lgan private chatlarga bog'langan. `/tabrik` inline tugmasi
+    bosilganda callback ichida `chat_id` kelmagani uchun shu update orqali
+    peerning haqiqiy chat_id'sini oldindan saqlab boramiz.
+    """
+    message = update.business_message
+    if message is None or not message.business_connection_id or not message.chat:
+        return
+    business_storage.record_business_message(
+        message.business_connection_id,
+        message.chat.id,
+        getattr(message, "date", None),
+    )
 
 
 async def _on_business_connection(update, context):
@@ -341,6 +365,140 @@ def _decode_data_url_image(data_url: str) -> bytes | None:
     return raw
 
 
+
+def _serve_drawing_generated(handler: "HealthHandler") -> bool:
+    """Drawing duel rasmlarini Telegram fetch qilishi uchun vaqtincha beradi."""
+    prefix = "/miniapp/rasim/generated/"
+    path = urlparse(handler.path).path
+    if not path.startswith(prefix):
+        return False
+    filename = path[len(prefix):]
+    if not re.fullmatch(r"[0-9a-f]{32}\.(?:jpg|jpeg|png)", filename):
+        handler.send_response(404); handler.end_headers(); return True
+    file_path = os.path.join(_WEBAPP_GENERATED_DIR, filename)
+    try:
+        with open(file_path, "rb") as f:
+            body = f.read()
+    except OSError:
+        handler.send_response(404); handler.end_headers(); return True
+    ctype = "image/jpeg" if filename.lower().endswith((".jpg", ".jpeg")) else "image/png"
+    handler.send_response(200)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "public, max-age=300")
+    handler.end_headers()
+    handler.wfile.write(body)
+    return True
+
+
+def _handle_draw_api(handler: "HealthHandler") -> None:
+    """1v1 rasm o'yini API: join/status/submit/restart."""
+    def reply(status: int, data=None, error: str = ""):
+        body = json.dumps({"ok": status < 400, "data": data, "error": error}, ensure_ascii=False).encode()
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    path = urlparse(handler.path).path
+    query = parse_qs(urlparse(handler.path).query)
+    rid = (query.get("room") or [""])[0]
+    init_data = handler.headers.get("X-Telegram-Init-Data", "")
+
+    if handler.command == "GET":
+        if path == "/api/draw/join":
+            data, err = drawing_game.join(rid, init_data)
+        elif path == "/api/draw/status":
+            data, err = drawing_game.status(rid, init_data)
+        else:
+            reply(404, error="Draw API topilmadi."); return
+        if data is None:
+            reply(400, error=err or "Xatolik."); return
+        reply(200, data=data); return
+
+    try:
+        length = int(handler.headers.get("Content-Length", 0))
+        if length <= 0 or length > 8 * 1024 * 1024:
+            reply(413, error="So'rov juda katta."); return
+        payload = json.loads(handler.rfile.read(length).decode("utf-8"))
+    except Exception:
+        reply(400, error="Noto'g'ri JSON."); return
+
+    rid = str(payload.get("room") or rid)
+    init_data = str(payload.get("init_data") or init_data)
+    if path == "/api/draw/submit":
+        image = str(payload.get("image") or "")
+        m = re.fullmatch(r"data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=]+)", image)
+        if not m:
+            reply(400, error="Rasm formati noto'g'ri."); return
+        try:
+            image_bytes = base64.b64decode(m.group(1), validate=True)
+        except Exception:
+            reply(400, error="Rasmni o'qib bo'lmadi."); return
+        result, err = drawing_game.submit(rid, init_data, image_bytes)
+        if result is None:
+            reply(400, error=err or "Rasm yuborilmadi."); return
+
+        # Telegram answerWebAppQuery uchun public JPEG URL tayyorlaymiz.
+        jpeg = result["image"]
+        os.makedirs(_WEBAPP_GENERATED_DIR, exist_ok=True)
+        filename = f"{uuid.uuid4().hex}.jpg"
+        file_path = os.path.join(_WEBAPP_GENERATED_DIR, filename)
+        with open(file_path, "wb") as f:
+            f.write(jpeg)
+        photo_url = f"{PUBLIC_BASE_URL}{_WEBAPP_GENERATED_URL_PREFIX}{filename}"
+        caption = result.get("caption", "")
+
+        if result.get("evaluate"):
+            prompt, img1, img2 = result["evaluate"]
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    drawing_game._evaluate(prompt, img1, img2), _MAIN_LOOP
+                )
+                evaluation = future.result(timeout=100)
+            except Exception as e:
+                logger.error("🎨 Drawing duel evaluation xato: %s", e, exc_info=True)
+                evaluation = {"player1": None, "player2": None, "winner": None, "comment": "AI vaqtida javob bermadi."}
+            room = drawing_game.finish_evaluation(rid, evaluation)
+            if room:
+                caption = drawing_game._telegram_caption(evaluation, room)
+
+        async def _answer():
+            from telegram import InlineQueryResultPhoto
+            result_obj = InlineQueryResultPhoto(
+                id=uuid.uuid4().hex,
+                photo_url=photo_url,
+                thumbnail_url=photo_url,
+                caption=caption[:1024],
+            )
+            return await _BOT_INSTANCE.answer_web_app_query(result["query_id"], result_obj)
+
+        try:
+            if not result.get("query_id"):
+                raise RuntimeError("WebApp query_id topilmadi.")
+            future = asyncio.run_coroutine_threadsafe(_answer(), _MAIN_LOOP)
+            future.result(timeout=30)
+        except Exception as e:
+            logger.error("🎨 Drawing duel Telegramga yuborish xato: %s", e, exc_info=True)
+            try: os.remove(file_path)
+            except OSError: pass
+            reply(502, error="Rasmni Telegram chatiga yuborib bo'lmadi."); return
+
+        Timer(_WEBAPP_GENERATED_TTL_SEC, lambda: os.path.exists(file_path) and os.remove(file_path)).start()
+        reply(200, data={"state": result["state"], "status": "submitted", "both_submitted": bool(result.get("evaluate"))})
+        return
+
+    if path == "/api/draw/restart":
+        data, err = drawing_game.restart(rid, init_data)
+        if data is None:
+            reply(400, error=err or "Qayta boshlash amalga oshmadi."); return
+        reply(200, data=data); return
+
+    reply(404, error="Draw API topilmadi.")
+
+
 def _handle_rasim_upload(handler: "HealthHandler") -> None:
     """POST /miniapp/rasim/upload — Mini App'dan chizilgan rasmni qabul
     qiladi, Telegram initData'ni tasdiqlaydi va rasmni TO'G'RI joyga
@@ -516,6 +674,33 @@ def _handle_rasim_upload_inline(handler, rid, verified_user, image_bytes, _json_
     _json_ok()
 
 
+def _serve_kino_router(handler: "HealthHandler") -> bool:
+    """Main Mini App router.
+
+    Direct Mini App link `t.me/<bot>?startapp=room_...` ochilganda Telegram
+    Main Mini App sifatida qaysi URL sozlanganidan qat'i nazar, shu router
+    start_paramni o'qib `/miniapp/kino/` ga o'tkazadi. Bu `/` health endpoint
+    avvalgi oddiy "bot ishlamoqda" matnini qaytarib, kino Mini App'ni sindirib
+    qo'ygan holatni tuzatadi.
+    """
+    path = urlparse(handler.path).path
+    if path not in ("/", "/miniapp", "/miniapp/"):
+        return False
+    router_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "index.html")
+    try:
+        with open(router_path, "rb") as f:
+            body = f.read()
+    except OSError:
+        return False
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+    return True
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == _PLACEHOLDER_PDF_PATH and _PLACEHOLDER_PDF_BYTES:
@@ -549,7 +734,45 @@ class HealthHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.startswith(_WEBAPP_GENERATED_URL_PREFIX):
+            if _serve_drawing_generated(self):
+                return
             self._serve_generated_image()
+            return
+
+        if self.path.startswith("/api/draw/"):
+            _handle_draw_api(self)
+            return
+
+        if self.path.startswith("/api/game/"):
+            game.handle_api(self)
+            return
+
+        if self.path.startswith("/miniapp/game"):
+            if game.serve_static(self):
+                return
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if self.path.startswith("/api/kino/stream/"):
+            stream_key = self.path.split("/api/kino/stream/", 1)[1].split("?", 1)[0]
+            parts = stream_key.split("/")
+            if len(parts) == 2:
+                movie_watch.serve_movie(self, parts[0], parts[1])
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
+
+        if self.path.startswith("/api/kino/"):
+            movie_watch.handle_api(self)
+            return
+
+        if self.path.startswith("/miniapp/kino"):
+            if movie_watch.serve_static(self):
+                return
+            self.send_response(404)
+            self.end_headers()
             return
 
         if self.path.startswith("/miniapp/rasim"):
@@ -561,6 +784,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                 return
             self.send_response(404)
             self.end_headers()
+            return
+
+        # Main Mini App router: / yoki /miniapp/ ga kirilganda Telegram
+        # start_param orqali room_<id> aniqlanadi va kino Mini App ochiladi.
+        if _serve_kino_router(self):
             return
 
         self.send_response(200)
@@ -634,6 +862,18 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         """💳 Kapitalbank to'lov webhook'i VA 🎨 /rasim Mini App rasm
         yuklash so'rovi shu yerga keladi."""
+        if self.path.startswith("/api/draw/"):
+            _handle_draw_api(self)
+            return
+
+        if self.path.startswith("/api/game/"):
+            game.handle_post(self)
+            return
+
+        if self.path.startswith("/api/kino/"):
+            movie_watch.handle_post(self)
+            return
+
         if self.path == "/miniapp/rasim/upload":
             _handle_rasim_upload(self)
             return
@@ -693,7 +933,7 @@ def start_health_server():
     _PRO_AUDIO_BYTES = _load_pro_audio_bytes()
     try:
         port = int(os.getenv("PORT", "10000"))
-        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
         print(f"🌐 HTTP server ishga tushdi: 0.0.0.0:{port}")
         server.serve_forever()
     except Exception as e:
@@ -703,6 +943,27 @@ def start_health_server():
 # ============================================================
 # CONVERSATION HANDLERLAR
 # ============================================================
+
+def build_kino_conv():
+    return ConversationHandler(
+        entry_points=[CommandHandler("kino", kino.kino_entry)],
+        states={
+            kino.KINO_MENU: [
+                CallbackQueryHandler(kino.kino_menu_callback, pattern=r"^kino:(?:upload|list)$"),
+                CallbackQueryHandler(kino.kino_open_callback, pattern=r"^kino:open:"),
+            ],
+            kino.KINO_WAIT_VIDEO: [
+                MessageHandler(filters.VIDEO | filters.Document.ALL, kino.kino_receive_video),
+            ],
+            kino.KINO_WAIT_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, kino.kino_receive_title),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", kino.kino_cancel)],
+        name="kino_conv",
+        allow_reentry=True,
+    )
+
 
 def build_course_work_conv():
     return ConversationHandler(
@@ -1051,6 +1312,7 @@ def main():
     # o'zgartirganda keladigan update. /tabrik'ning Business oqimi
     # (tabrik_business.py) shu saqlangan ma'lumotdan foydalanadi.
     app.add_handler(BusinessConnectionHandler(_on_business_connection))
+    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, _on_business_message))
     # 🎨 /rasim — Telegram Mini App orqali rasm chizish.
     app.add_handler(CommandHandler("rasim", rasim.rasim_cmd))
     # 🎬 /vid — video yuklab olish (ASCII buyruq, Privacy Mode'dan qat'i
@@ -1104,6 +1366,7 @@ def main():
     app.add_handler(build_reminders_conv())
     app.add_handler(build_wallet_topup_conv())
     app.add_handler(build_developer_conv())
+    app.add_handler(build_kino_conv())
 
     app.add_handler(CallbackQueryHandler(menu.universal_selected, pattern="^menu:universal$"))
     app.add_handler(CallbackQueryHandler(menu.back_to_menu, pattern="^menu:back$"))
