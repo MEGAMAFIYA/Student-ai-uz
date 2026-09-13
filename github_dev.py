@@ -57,17 +57,69 @@ def _headers() -> dict[str, str]:
 
 
 def _raise_response(response: httpx.Response) -> None:
+    """Raise a useful GitHub error and log enough diagnostics to find the cause.
+
+    IMPORTANT: never log Authorization or the token itself.
+    """
     if response.is_success:
         return
+
     try:
         data = response.json()
         message = data.get("message") or response.text
+        error_doc = data.get("documentation_url") or "-"
     except Exception:
+        data = {}
         message = response.text
+        error_doc = "-"
+
+    # These headers are safe diagnostics: they do not contain the PAT.
+    request_id = response.headers.get("x-github-request-id", "-")
+    oauth_scopes = response.headers.get("x-oauth-scopes", "-")
+    accepted_scopes = response.headers.get("x-accepted-oauth-scopes", "-")
+    accepted_github_permissions = response.headers.get("x-accepted-github-permissions", "-")
+    endpoint = str(response.request.url)
+    # Do not log query-string secrets if a future endpoint ever contains them.
+    endpoint = endpoint.split("?", 1)[0]
+
+    logger.error(
+        "GitHub API FAILED status=%s method=%s endpoint=%s "
+        "request_id=%s message=%r documentation=%s "
+        "oauth_scopes=%r accepted_oauth_scopes=%r "
+        "accepted_github_permissions=%r response_headers=%s",
+        response.status_code,
+        response.request.method,
+        endpoint,
+        request_id,
+        message,
+        error_doc,
+        oauth_scopes,
+        accepted_scopes,
+        accepted_github_permissions,
+        {
+            k: v for k, v in response.headers.items()
+            if k.lower() in {
+                "x-github-request-id",
+                "x-oauth-scopes",
+                "x-accepted-oauth-scopes",
+                "x-accepted-github-permissions",
+                "x-github-media-type",
+                "retry-after",
+            }
+        },
+    )
+
     if response.status_code in (401, 403):
+        if response.status_code == 403:
+            raise GitHubDevError(
+                f"GitHub ruxsat xatosi (403): {message}. "
+                f"request_id={request_id}. "
+                "Logda endpoint, token scope va GitHub response tafsilotlari yozildi. "
+                "Fine-grained PAT uchun Repository access va Contents → Read and write ni tekshiring."
+            )
         raise GitHubDevError(
-            f"GitHub ruxsat xatosi ({response.status_code}): {message}. "
-            "Tokenning repository Access/Contents huquqlarini tekshiring."
+            f"GitHub autentifikatsiya xatosi (401): {message}. "
+            f"request_id={request_id}. GITHUB_TOKEN ni tekshiring."
         )
     if response.status_code == 404:
         raise GitHubDevError("Repository yoki fayl topilmadi, yoki token unga kira olmaydi.")
@@ -81,6 +133,10 @@ def _request(method: str, url: str, **kwargs) -> httpx.Response:
         with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as client:
             response = client.request(method, url, headers=_headers(), **kwargs)
     except httpx.HTTPError as exc:
+        logger.exception(
+            "GitHub API connection FAILED method=%s endpoint=%s error=%r",
+            method, url.split("?", 1)[0], exc
+        )
         raise GitHubDevError(f"GitHub bilan ulanishda xato: {exc}") from exc
     _raise_response(response)
     return response
@@ -187,7 +243,6 @@ def read_file(repo: str, path: str, branch: str | None = None) -> dict[str, Any]
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise GitHubDevError("Bu binary fayl. Uni matn muharriri orqali tahrirlash xavfsiz emas.") from exc
-    logger.info("GitHub ZIP stage=completed repo=%s branch=%s files=%d commit=%s", repo, branch, len(final_files), new_commit_sha)
     return {
         "repo": repo,
         "path": data.get("path") or path,
@@ -289,6 +344,23 @@ def _is_protected_zip_path(path: str) -> bool:
     if name.startswith(".env.") or name.endswith(_PROTECTED_ZIP_SUFFIXES):
         return True
     return False
+
+
+def _is_github_workflow_path(path: str) -> bool:
+    """Return True for GitHub Actions workflow files.
+
+    GitHub treats files below .github/workflows specially. A token can have
+    ordinary Contents write access and still be denied when a workflow file
+    is changed unless the token also has workflow-related permission.
+    """
+    normalized = (path or "").replace("\\", "/").strip("/")
+    parts = [part for part in normalized.split("/") if part]
+    return (
+        len(parts) >= 3
+        and parts[0].lower() == ".github"
+        and parts[1].lower() == "workflows"
+        and parts[-1].lower().endswith((".yml", ".yaml"))
+    )
 
 
 def _normalize_zip_path(name: str) -> str:
@@ -421,9 +493,63 @@ def upload_zip_project(
         repo, len(final_files), sum(len(v) for v in final_files.values()), common_root or "-", skipped_protected,
     )
 
+    workflow_paths = sorted(
+        path for path in final_files if _is_github_workflow_path(path)
+    )
+    if workflow_paths:
+        logger.warning(
+            "GitHub ZIP stage=workflow_files_detected repo=%s count=%d paths=%s "
+            "note=GitHub_Actions_workflow_files_require_workflow_write_permission",
+            repo,
+            len(workflow_paths),
+            workflow_paths,
+        )
+    else:
+        logger.info(
+            "GitHub ZIP stage=workflow_files_detected repo=%s count=0",
+            repo,
+        )
+
     repo_info = get_repository(repo)
     branch = branch or repo_info.get("default_branch") or "main"
     owner, name = _repo_parts(repo)
+
+    # Preflight repository permissions before creating 24+ orphan Git blobs.
+    # GitHub may allow blob creation while refusing tree creation when the
+    # token does not have write access to this repository. This check makes
+    # that situation explicit in Render logs.
+    permissions = repo_info.get("permissions") or {}
+    logger.info(
+        "GitHub ZIP stage=repo_permission_check repo=%s owner=%s name=%s "
+        "private=%s default_branch=%s repo_permissions=%s security_and_analysis=%s",
+        repo,
+        repo_info.get("owner", {}).get("login") or owner,
+        name,
+        repo_info.get("private"),
+        repo_info.get("default_branch"),
+        {
+            "admin": permissions.get("admin"),
+            "maintain": permissions.get("maintain"),
+            "push": permissions.get("push"),
+            "triage": permissions.get("triage"),
+            "pull": permissions.get("pull"),
+        },
+        repo_info.get("security_and_analysis"),
+    )
+
+    if permissions and permissions.get("push") is False:
+        logger.error(
+            "GitHub ZIP stage=permission_denied repo=%s reason=no_push_permission "
+            "permissions=%s. Token can read this repository but cannot write to it.",
+            repo,
+            permissions,
+        )
+        raise GitHubDevError(
+            f"GitHub repositoryga yozish huquqi yo'q: {repo}. "
+            "Token repositoryga kira oladi, lekin push/write huquqi yo'q. "
+            "Fine-grained PAT → Repository access → shu repo → "
+            "Repository permissions → Contents = Read and write qiling."
+        )
 
     # Read the current branch tip and base tree. `base_tree` makes this an
     # additive/overwrite merge: every repository path not mentioned by the ZIP
@@ -473,12 +599,45 @@ def upload_zip_project(
             raise GitHubDevError(f"GitHub blob yaratilmadi: {path}")
         tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
-    logger.info("GitHub ZIP stage=tree_create repo=%s entries=%d", repo, len(tree_entries))
-    new_tree = _request(
-        "POST",
-        f"{_API}/repos/{owner}/{name}/git/trees",
-        json={"base_tree": base_tree, "tree": tree_entries},
-    ).json()
+    logger.info(
+        "GitHub ZIP stage=tree_create_start repo=%s branch=%s base_tree=%s entries=%d",
+        repo, branch, base_tree, len(tree_entries)
+    )
+    try:
+        new_tree = _request(
+            "POST",
+            f"{_API}/repos/{owner}/{name}/git/trees",
+            json={"base_tree": base_tree, "tree": tree_entries},
+        ).json()
+    except GitHubDevError as exc:
+        logger.exception(
+            "GitHub ZIP stage=tree_create_failed repo=%s branch=%s "
+            "base_tree=%s entries=%d error=%s",
+            repo, branch, base_tree, len(tree_entries), exc
+        )
+        if workflow_paths:
+            logger.error(
+                "GitHub ZIP stage=workflow_permission_likely repo=%s "
+                "workflow_count=%d workflow_paths=%s error=%s",
+                repo,
+                len(workflow_paths),
+                workflow_paths,
+                exc,
+            )
+            raise GitHubDevError(
+                "GitHub ZIP ichida GitHub Actions workflow fayli bor va GitHub uni "
+                "token ruxsati sabab qabul qilmadi. "
+                f"Workflow fayllari: {', '.join(workflow_paths)}. "
+                "Fine-grained PAT uchun Repository access → shu repository → "
+                "Contents = Read and write VA Workflows = Read and write ni bering. "
+                "So'ng Render'dagi GITHUB_TOKEN ni yangilang va redeploy qiling. "
+                f"Asl GitHub xatosi: {exc}"
+            ) from exc
+        raise GitHubDevError(
+            "GitHub ZIP tree yaratish bosqichida xato. "
+            "Render logida `GitHub API FAILED` va `tree_create_failed` qatorlarini tekshiring. "
+            f"Asl xato: {exc}"
+        ) from exc
     new_tree_sha = new_tree.get("sha")
     if not new_tree_sha:
         raise GitHubDevError("GitHub yangi tree yaratmadi.")
