@@ -267,8 +267,7 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎵 Qo'shiq qidirish", callback_data="dev:music"),
          InlineKeyboardButton("💎 Pro / Tabrik", callback_data="dev:pt")],
         [InlineKeyboardButton("📊 Statistika", callback_data="dev:stats"),
-         InlineKeyboardButton("🧪 Testlarni sinash", callback_data="dev:tests"),
-         InlineKeyboardButton("📝 Testlar bazasi", callback_data="dev:managed_tests")],
+         InlineKeyboardButton("🧪 Testlarni sinash", callback_data="dev:tests")],
         [InlineKeyboardButton("☁️ RENDER", callback_data="dev:render"),
          InlineKeyboardButton("☁️ GitHub", callback_data="dev:github")],
         [InlineKeyboardButton("🔍 Inline jurnali", callback_data="dev:inlinelog:all")],
@@ -1391,7 +1390,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # oldingi "kutilayotgan matn kiritish" holatini tozalaydi — pastda
     # tegishli branch (edit/keyaddprov/keyrepl/keymodel/bulkprov/keybulkscope)
     # kerak bo'lsa uni qaytadan o'rnatadi.
-    if action not in ("edit", "bulkprov", "keyaddprov", "keyrepl", "keymodel", "keybulkscope", "priceedit", "balsearch", "ptsong", "ptemoji", "ptdelay", "ptrevert", "gh", "github", "mt_stop"):
+    if action not in ("edit", "bulkprov", "keyaddprov", "keyrepl", "keymodel", "keybulkscope", "priceedit", "balsearch", "ptsong", "ptemoji", "ptdelay", "ptrevert", "gh", "github"):
         context.user_data.pop("dev_action", None)
 
     # ---------- Asosiy menyu ----------
@@ -1414,10 +1413,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_edit_query(query, _moliya_menu_text(), reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
         return DEV_MENU
 
-    # ---------- 📝 Boshqariladigan testlar ----------
-    if action == "managed_tests" or action.startswith("mt_"):
-        from handlers import managed_tests
-        return await managed_tests.handle_dev_callback(action, parts, update, context, query, DEV_MENU, DEV_WAIT_TEXT)
     # ---------- 🧪 Loyiha testlari ----------
     if action == "tests":
         await _safe_edit_query(query, "🧪 <b>tests/ papkasi tekshirilmoqda...</b>\nBarcha testlar ishga tushirilmoqda, biroz kuting.", parse_mode="HTML")
@@ -2240,10 +2235,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mt_action = context.user_data.get("dev_action") or {}
-    if str(mt_action.get("type", "")).startswith("mt_"):
-        from handlers import managed_tests
-        return await managed_tests.handle_dev_text(mt_action, update, context, DEV_MENU, DEV_WAIT_TEXT)
     if not _is_admin(update):
         return ConversationHandler.END
 
