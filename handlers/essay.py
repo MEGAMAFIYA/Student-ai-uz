@@ -9,6 +9,8 @@ sahifa sonini yetkazish) kurs ishi bilan bir xil sifat darajasida.
 import asyncio
 import json
 import logging
+
+from cancel_registry import cancel_markup
 import re
 
 from telegram import Update, InputFile
@@ -105,7 +107,8 @@ async def receive_topic_and_generate(update: Update, context: ContextTypes.DEFAU
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     status = await update.message.reply_text(
-        f"⏳ *{topic}* mavzusida {pages}+ betlik {label.lower()} tayyorlanmoqda...", parse_mode=ParseMode.MARKDOWN
+        f"⏳ *{topic}* mavzusida {pages}+ betlik {label.lower()} tayyorlanmoqda...", parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_markup(),
     )
 
     try:
@@ -131,8 +134,8 @@ async def receive_topic_and_generate(update: Update, context: ContextTypes.DEFAU
     msg = await update.message.reply_document(
         document=InputFile(pdf_buf, filename=f"{topic[:40]}.pdf"),
         caption=f"🗒 {label}: {topic}\n📎 {actual_pages} bet (so'ralgan: {pages}+).",
-        reply_markup=main_menu_keyboard(),
     )
+    await update.message.reply_text("🏠 Bosh menyu:", reply_markup=main_menu_keyboard())
     if user_id and msg.document:
         storage.record_file(user_id, "essay", topic, msg.document.file_id)
         storage.record_usage("essay", user_id)
@@ -212,7 +215,7 @@ async def generate_essay(topic: str, pages: int, work_type: str, status_msg=None
 
     if status_msg:
         try:
-            await status_msg.edit_text(f"⏳ *{topic}*\nReja tuzilmoqda...", parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(f"⏳ *{topic}*\nReja tuzilmoqda...", parse_mode=ParseMode.MARKDOWN, reply_markup=cancel_markup())
         except Exception:
             pass
 
@@ -227,7 +230,7 @@ async def generate_essay(topic: str, pages: int, work_type: str, status_msg=None
     for i, title in enumerate(part_titles, start=1):
         if status_msg:
             try:
-                await status_msg.edit_text(f"⏳ *{topic}*\n{i}/{len(part_titles)}-qism yozilmoqda: {title}", parse_mode=ParseMode.MARKDOWN)
+                await status_msg.edit_text(f"⏳ *{topic}*\n{i}/{len(part_titles)}-qism yozilmoqda: {title}", parse_mode=ParseMode.MARKDOWN, reply_markup=cancel_markup())
             except Exception:
                 pass
         content = await _generate_section(topic, title, f"'{title}' haqida batafsil yoz (mavzu: '{topic}').", part_words)
@@ -269,7 +272,7 @@ async def generate_essay(topic: str, pages: int, work_type: str, status_msg=None
 
     if status_msg:
         try:
-            await status_msg.edit_text(f"⏳ *{topic}*\nPDF yig'ilmoqda...", parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(f"⏳ *{topic}*\nPDF yig'ilmoqda...", parse_mode=ParseMode.MARKDOWN, reply_markup=cancel_markup())
         except Exception:
             pass
 

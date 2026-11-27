@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 _API = "https://api.github.com"
 _TIMEOUT = 30.0
 _MAX_REPOS = 500
-_MAX_DIR_ITEMS = 200
+_MAX_DIR_ITEMS = 1000
 _MAX_TEXT_BYTES = 900_000
 _MAX_VIEW_CHARS = 15_000
 
@@ -320,6 +320,108 @@ def delete_file(repo: str, path: str, branch: str | None = None, sha: str | None
     response = _request("DELETE", _contents_url(repo, path), json=body)
     return response.json()
 
+
+def delete_directory(repo: str, path: str, branch: str | None = None) -> dict[str, Any]:
+    """Delete a whole folder (and everything inside it) in a single commit.
+
+    Only blob paths that live strictly under ``path/`` are removed; every
+    other file in the repository — including sibling files and folders —
+    is left untouched. Uses the Git Data API (recursive tree read + a tree
+    that nulls out the removed blobs) instead of deleting file by file, so
+    the whole folder disappears in exactly one commit.
+    """
+    raw_path = (path or "").strip()
+    if not raw_path or raw_path in ("/", "."):
+        raise GitHubDevError("Ildiz papkani bu yerdan o'chirib bo'lmaydi.")
+    if raw_path.startswith("/") or "\\\\" in raw_path:
+        raise GitHubDevError("Papka yo'li noto'g'ri.")
+    path = raw_path.rstrip("/")
+    if not path or any(part in ("", ".", "..") for part in path.split("/")):
+        raise GitHubDevError("Papka yo'li noto'g'ri.")
+
+    branch = branch or (get_repository(repo).get("default_branch") or "main")
+    owner, name = _repo_parts(repo)
+
+    ref = _request("GET", f"{_API}/repos/{owner}/{name}/git/ref/heads/{branch}").json()
+    old_commit_sha = (ref.get("object") or {}).get("sha")
+    if not old_commit_sha:
+        raise GitHubDevError("Branch HEAD aniqlanmadi.")
+
+    commit = _request("GET", f"{_API}/repos/{owner}/{name}/git/commits/{old_commit_sha}").json()
+    base_tree = (commit.get("tree") or {}).get("sha")
+    if not base_tree:
+        raise GitHubDevError("Repository tree aniqlanmadi.")
+
+    tree_resp = _request(
+        "GET", f"{_API}/repos/{owner}/{name}/git/trees/{base_tree}", params={"recursive": "1"}
+    ).json()
+    all_entries = tree_resp.get("tree") or []
+    if tree_resp.get("truncated"):
+        # A truncated recursive tree is incomplete; deleting from it could
+        # leave files behind while falsely reporting success. Fail closed.
+        logger.warning("GitHub deldir stage=tree_truncated repo=%s path=%s", repo, path)
+        raise GitHubDevError(
+            "GitHub tree ro'yxati to'liq emas (truncated). Xavfsizlik uchun "
+            "papka o'chirilmadi; qayta urinib ko'ring."
+        )
+
+    prefix = path + "/"
+    # Faqat shu papka ICHIDAGI fayllar (blob) — boshqa hech narsaga tegilmaydi.
+    to_delete = [
+        e for e in all_entries
+        if e.get("type") == "blob" and e.get("path", "").startswith(prefix)
+    ]
+    if not to_delete:
+        raise GitHubDevError("Bu papka bo'sh yoki allaqachon o'chirilgan.")
+
+    # GitHub Git Trees API: base_tree bilan tree yaratilganda, mavjud entry'ni
+    # olib tashlash uchun uning sha'sini null qilib yuboriladi.
+    tree_entries = [
+        {"path": e["path"], "mode": e.get("mode") or "100644", "type": "blob", "sha": None}
+        for e in to_delete
+    ]
+    new_tree = _request(
+        "POST",
+        f"{_API}/repos/{owner}/{name}/git/trees",
+        json={"base_tree": base_tree, "tree": tree_entries},
+    ).json()
+    new_tree_sha = new_tree.get("sha")
+    if not new_tree_sha:
+        raise GitHubDevError("GitHub yangi tree yaratmadi.")
+
+    new_commit = _request(
+        "POST",
+        f"{_API}/repos/{owner}/{name}/git/commits",
+        json={
+            "message": f"Delete folder {path} ({len(to_delete)} files)",
+            "tree": new_tree_sha,
+            "parents": [old_commit_sha],
+        },
+    ).json()
+    new_commit_sha = new_commit.get("sha")
+    if not new_commit_sha:
+        raise GitHubDevError("GitHub commit yaratmadi.")
+
+    try:
+        _request(
+            "PATCH",
+            f"{_API}/repos/{owner}/{name}/git/refs/heads/{branch}",
+            json={"sha": new_commit_sha, "force": False},
+        )
+    except GitHubDevError as exc:
+        raise GitHubDevError(
+            "Papka o'chirish commit'i tayyorlandi, lekin branch shu orada boshqa "
+            "commitga o'zgargani uchun avtomatik qo'llanmadi. Hech narsa ustidan "
+            "majburan yozilmadi. Qayta urinib ko'ring."
+        ) from exc
+
+    return {
+        "repo": repo,
+        "branch": branch,
+        "path": path,
+        "deleted_files": len(to_delete),
+        "commit_sha": new_commit_sha,
+    }
 
 
 _MAX_ZIP_BYTES = 20 * 1024 * 1024
@@ -701,3 +803,33 @@ def format_size(size: int) -> str:
 
 def item_icon(item_type: str) -> str:
     return {"dir": "📁", "file": "📄", "symlink": "🔗", "submodule": "📦"}.get(item_type, "❓")
+
+
+def count_folder_files(repo: str, path: str, branch: str | None = None) -> int:
+    """Count files under a repository directory without modifying GitHub."""
+    raw_path = (path or "").strip()
+    if not raw_path or raw_path in ("/", ".") or raw_path.startswith("/") or "\\\\" in raw_path:
+        raise GitHubDevError("Papka yo'li noto'g'ri.")
+    path = raw_path.rstrip("/")
+    if not path or any(part in ("", ".", "..") for part in path.split("/")):
+        raise GitHubDevError("Papka yo'li noto'g'ri.")
+    branch = branch or (get_repository(repo).get("default_branch") or "main")
+    owner, name = _repo_parts(repo)
+    ref = _request("GET", f"{_API}/repos/{owner}/{name}/git/ref/heads/{branch}").json()
+    commit_sha = (ref.get("object") or {}).get("sha")
+    if not commit_sha:
+        raise GitHubDevError("Branch HEAD aniqlanmadi.")
+    commit = _request("GET", f"{_API}/repos/{owner}/{name}/git/commits/{commit_sha}").json()
+    tree_sha = (commit.get("tree") or {}).get("sha")
+    if not tree_sha:
+        raise GitHubDevError("Repository tree aniqlanmadi.")
+    tree_resp = _request(
+        "GET", f"{_API}/repos/{owner}/{name}/git/trees/{tree_sha}", params={"recursive": "1"}
+    ).json()
+    if tree_resp.get("truncated"):
+        raise GitHubDevError("GitHub tree ro'yxati to'liq emas; fayllar soni aniqlanmadi.")
+    prefix = path + "/"
+    return sum(
+        1 for entry in (tree_resp.get("tree") or [])
+        if entry.get("type") == "blob" and str(entry.get("path", "")).startswith(prefix)
+    )

@@ -67,7 +67,6 @@ config.persist_read = _fake_persist_read
 config.persist_write = _fake_persist_write
 
 import wallet  # noqa: E402
-import payment_providers  # noqa: E402
 
 
 def _reset_wallet_state():
@@ -82,8 +81,47 @@ def _reset_wallet_state():
         "features": {k: dict(v) for k, v in wallet._DEFAULT_FEATURES.items()},
         "audit_log": [],
         "reservations": {},
+        "registered_users": {},
+        "referrals": {},
     }
     _FAKE_STORE.clear()
+
+
+class WalletReferralTests(unittest.TestCase):
+    def setUp(self):
+        _reset_wallet_state()
+
+    def test_referral_gives_inviter_5000_and_invitee_10000(self):
+        wallet.register_start(100, previously_seen=True)
+        result = wallet.register_start(200, referrer_id=100)
+        self.assertEqual(result["welcome_bonus"], 10000)
+        self.assertEqual(result["referral_bonus"], 5000)
+        self.assertEqual(wallet.get_balance(200), 10000)
+        self.assertEqual(wallet.get_balance(100), 5000)
+
+    def test_existing_prestart_balance_is_topped_up_to_10000(self):
+        wallet._data["wallets"]["200"] = {"balance": 8000}
+        wallet.register_start(100, previously_seen=True)
+        result = wallet.register_start(200, referrer_id=100)
+        self.assertEqual(result["welcome_bonus"], 2000)
+        self.assertEqual(result["referral_bonus"], 5000)
+        self.assertEqual(wallet.get_balance(200), 10000)
+        self.assertEqual(wallet.get_balance(100), 5000)
+
+    def test_repeat_start_does_not_duplicate_any_bonus(self):
+        wallet.register_start(100, previously_seen=True)
+        wallet.register_start(200, referrer_id=100)
+        result = wallet.register_start(200, referrer_id=100)
+        self.assertEqual(result["welcome_bonus"], 0)
+        self.assertEqual(result["referral_bonus"], 0)
+        self.assertEqual(wallet.get_balance(200), 10000)
+        self.assertEqual(wallet.get_balance(100), 5000)
+
+    def test_known_legacy_user_does_not_receive_bonus(self):
+        wallet._data["wallets"]["200"] = {"balance": 8000}
+        result = wallet.register_start(200, referrer_id=100, previously_seen=True)
+        self.assertEqual(result["welcome_bonus"], 0)
+        self.assertEqual(wallet.get_balance(200), 8000)
 
 
 class WalletBalanceTests(unittest.TestCase):
@@ -142,14 +180,14 @@ class FeatureChargeTests(unittest.TestCase):
 
     def test_paid_feature_charges_correct_amount(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.charge_for_feature(1, "course_work")  # standart narx 10000
+        result = wallet.charge_for_feature(1, "course_work_20")  # standart narx 10000
         self.assertTrue(result.ok)
         self.assertEqual(result.reason, "charged")
         self.assertEqual(wallet.get_balance(1), 10000)
 
     def test_insufficient_balance_blocks_feature(self):
         wallet.credit_balance(1, 5000, "boshlang'ich")
-        result = wallet.charge_for_feature(1, "course_work")  # narx 10000
+        result = wallet.charge_for_feature(1, "course_work_20")  # narx 10000
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "insufficient")
         self.assertEqual(result.price, 10000)
@@ -159,8 +197,8 @@ class FeatureChargeTests(unittest.TestCase):
 
     def test_disabled_feature_blocks_even_with_balance(self):
         wallet.credit_balance(1, 100000, "boshlang'ich")
-        wallet.set_feature_enabled("course_work", False)
-        result = wallet.charge_for_feature(1, "course_work")
+        wallet.set_feature_enabled("course_work_20", False)
+        result = wallet.charge_for_feature(1, "course_work_20")
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "disabled")
         self.assertEqual(wallet.get_balance(1), 100000)
@@ -174,8 +212,8 @@ class FeatureChargeTests(unittest.TestCase):
         self.assertEqual(wallet.get_balance(1), 0)
 
     def test_zero_price_makes_feature_free(self):
-        wallet.set_feature_price("course_work", 0)
-        result = wallet.charge_for_feature(1, "course_work")
+        wallet.set_feature_price("course_work_20", 0)
+        result = wallet.charge_for_feature(1, "course_work_20")
         self.assertTrue(result.ok)
         self.assertEqual(result.reason, "free")
 
@@ -185,14 +223,14 @@ class PaymentConfirmationTests(unittest.TestCase):
         _reset_wallet_state()
 
     def test_successful_payment_credits_balance_once(self):
-        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
+        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
         ok = wallet.confirm_payment(payment["payment_id"], actor_id="webhook", source="webhook")
         self.assertTrue(ok)
         self.assertEqual(wallet.get_balance(1), 10000)
         self.assertEqual(wallet.get_payment(payment["payment_id"])["status"], wallet.STATUS_PAID)
 
     def test_duplicate_webhook_does_not_double_credit(self):
-        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
+        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
         first = wallet.confirm_payment(payment["payment_id"], source="webhook")
         second = wallet.confirm_payment(payment["payment_id"], source="webhook")  # xuddi shu webhook qayta keldi
         third = wallet.confirm_payment(payment["payment_id"], source="webhook")
@@ -202,14 +240,14 @@ class PaymentConfirmationTests(unittest.TestCase):
         self.assertEqual(wallet.get_balance(1), 10000)  # FAQAT bir marta kredit qilingan
 
     def test_failed_payment_no_credit(self):
-        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
+        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
         wallet.set_payment_status(payment["payment_id"], wallet.STATUS_FAILED)
         ok = wallet.confirm_payment(payment["payment_id"])
         self.assertFalse(ok)
         self.assertEqual(wallet.get_balance(1), 0)
 
     def test_cancelled_payment_no_credit(self):
-        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
+        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
         wallet.set_payment_status(payment["payment_id"], wallet.STATUS_CANCELLED)
         ok = wallet.confirm_payment(payment["payment_id"])
         self.assertFalse(ok)
@@ -246,8 +284,8 @@ class DuplicateProtectionTests(unittest.TestCase):
         _reset_wallet_state()
 
     def test_duplicate_provider_transaction_id_rejected(self):
-        p1 = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
-        p2 = wallet.create_payment(2, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
+        p1 = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
+        p2 = wallet.create_payment(2, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
 
         wallet.register_provider_transaction(p1["payment_id"], "kapitalbank", "TXN123")
         with self.assertRaises(wallet.DuplicateTransactionError) as ctx:
@@ -279,7 +317,7 @@ class ConcurrencyTests(unittest.TestCase):
         _reset_wallet_state()
 
     def test_concurrent_confirm_same_payment_credits_once(self):
-        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
+        payment = wallet.create_payment(1, 10000, provider="kapitalbank", method=wallet.METHOD_BANK_RECEIPT)
         results = []
 
         def worker():
@@ -324,7 +362,7 @@ class ConcurrencyTests(unittest.TestCase):
         lock = threading.Lock()
 
         def worker():
-            r = wallet.charge_for_feature(1, "course_work")
+            r = wallet.charge_for_feature(1, "course_work_20")
             with lock:
                 results.append(r.ok)
 
@@ -338,39 +376,84 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(wallet.get_balance(1), 0)
 
 
-class PaymentProviderTests(unittest.TestCase):
-    """Kapitalbank adapterlari SOZLANMAGAN holatda xavfsiz ishlashini
-    tekshiradi (real API mavjud bo'lmagani uchun har doim shunday bo'lishi
-    kerak, hozircha credentials berilmagan)."""
+class AutoHoldAndRevokeTests(unittest.TestCase):
+    """🤖 'auto_hold' (bot tekshirdi, admin kutilmoqda) va 🚫 revoke_payment
+    (soxta deb qaytarish, qarz holati) senariylarini tekshiradi."""
 
-    def test_ecommerce_provider_reports_not_configured(self):
-        provider = payment_providers.KapitalbankPaymentProvider()
-        self.assertFalse(provider.is_configured())
+    def setUp(self):
+        _reset_wallet_state()
 
-    def test_create_order_fails_gracefully_when_not_configured(self):
-        provider = payment_providers.KapitalbankPaymentProvider()
+    def test_auto_hold_then_due_auto_confirm_credits_balance_once(self):
+        payment = wallet.create_payment(1, 10000, provider="manual", method=wallet.METHOD_BANK_RECEIPT)
+        due = wallet.mark_auto_hold(payment["payment_id"], delay_seconds=0)
+        self.assertIsNotNone(due)
+        self.assertEqual(wallet.get_payment(payment["payment_id"])["status"], wallet.STATUS_AUTO_HOLD)
+        self.assertEqual(wallet.get_balance(1), 0)
 
-        async def _run():
-            return await provider.create_order("pay_test123", 10000)
+        due_ids = wallet.get_due_auto_payments()
+        self.assertIn(payment["payment_id"], due_ids)
 
-        result = asyncio.run(_run())
-        self.assertFalse(result.ok)
-        self.assertEqual(result.error, "not_configured")
-        self.assertIsNotNone(result.user_message)
+        ok = wallet.auto_confirm_payment(payment["payment_id"])
+        self.assertTrue(ok)
+        self.assertEqual(wallet.get_balance(1), 10000)
+        self.assertEqual(wallet.get_payment(payment["payment_id"])["status"], wallet.STATUS_PAID)
+        self.assertTrue(wallet.get_payment(payment["payment_id"])["auto_confirmed"])
 
-    def test_verifier_reports_not_configured(self):
-        verifier = payment_providers.KapitalbankTransactionVerifier()
+        # Ikkinchi marta chaqirilsa — HECH NARSA qilmasin (idempotent).
+        ok2 = wallet.auto_confirm_payment(payment["payment_id"])
+        self.assertFalse(ok2)
+        self.assertEqual(wallet.get_balance(1), 10000)
 
-        async def _run():
-            return await verifier.verify_transaction({"amount": 10000}, expected_amount=10000)
+    def test_admin_approve_before_due_prevents_double_credit(self):
+        payment = wallet.create_payment(1, 10000, provider="manual", method=wallet.METHOD_BANK_RECEIPT)
+        wallet.mark_auto_hold(payment["payment_id"], delay_seconds=3600)
+        # Admin muddatdan OLDIN tasdiqlaydi -> pul DARHOL tushadi.
+        ok = wallet.approve_manual_payment(payment["payment_id"], actor_id=999)
+        self.assertTrue(ok)
+        self.assertEqual(wallet.get_balance(1), 10000)
+        # Fon vazifasi (muddat "kelganda") xuddi shu to'lovni yana tasdiqlamoqchi
+        # bo'lsa ham — status endi AUTO_HOLD emas (PAID), demak hech narsa bo'lmaydi.
+        ok2 = wallet.auto_confirm_payment(payment["payment_id"])
+        self.assertFalse(ok2)
+        self.assertEqual(wallet.get_balance(1), 10000)
 
-        result = asyncio.run(_run())
-        self.assertFalse(result.ok)
-        self.assertEqual(result.reason, "not_configured")
+    def test_admin_reject_before_due_prevents_auto_confirm(self):
+        payment = wallet.create_payment(1, 10000, provider="manual", method=wallet.METHOD_BANK_RECEIPT)
+        wallet.mark_auto_hold(payment["payment_id"], delay_seconds=3600)
+        self.assertTrue(wallet.reject_payment(payment["payment_id"], actor_id=999))
+        ok = wallet.auto_confirm_payment(payment["payment_id"])
+        self.assertFalse(ok)
+        self.assertEqual(wallet.get_balance(1), 0)
 
-    def test_webhook_signature_rejected_without_secret(self):
-        provider = payment_providers.KapitalbankPaymentProvider()
-        self.assertFalse(provider.verify_webhook_signature({}, b"{}"))
+    def test_revoke_payment_debits_balance_and_allows_negative(self):
+        payment = wallet.create_payment(1, 10000, provider="manual", method=wallet.METHOD_BANK_RECEIPT)
+        self.assertTrue(wallet.confirm_payment(payment["payment_id"], actor_id="admin_1"))
+        self.assertEqual(wallet.get_balance(1), 10000)
+
+        # Foydalanuvchi pulning bir qismini ishlatib bo'lgan (masalan 8000).
+        wallet.debit_balance(1, 8000, "feature_charge")
+        self.assertEqual(wallet.get_balance(1), 2000)
+
+        # Admin to'lovni SOXTA deb topib qaytaradi -> butun 10000 ayriladi -> balans -8000 (qarz).
+        result = wallet.revoke_payment(payment["payment_id"], actor_id="admin_1", reason="soxta chek")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["amount"], 10000)
+        self.assertEqual(result["balance_before"], 2000)
+        self.assertEqual(result["balance_after"], -8000)
+        self.assertEqual(wallet.get_balance(1), -8000)
+        self.assertEqual(wallet.get_payment(payment["payment_id"])["status"], wallet.STATUS_REVOKED)
+
+        # Idempotent: ikkinchi marta qaytarib bo'lmaydi.
+        result2 = wallet.revoke_payment(payment["payment_id"], actor_id="admin_1")
+        self.assertIsNone(result2)
+        self.assertEqual(wallet.get_balance(1), -8000)
+
+    def test_revoke_only_applies_to_paid_payments(self):
+        payment = wallet.create_payment(1, 10000, provider="manual", method=wallet.METHOD_BANK_RECEIPT)
+        # Hali 'paid' emas (pending) — qaytarib bo'lmaydi.
+        result = wallet.revoke_payment(payment["payment_id"], actor_id="admin_1")
+        self.assertIsNone(result)
+        self.assertEqual(wallet.get_balance(1), 0)
 
 
 class ReservationBasicTests(unittest.TestCase):
@@ -381,7 +464,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_successful_reservation_then_completion_debits_once(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")  # narx 10000
+        result = wallet.reserve_for_feature(1, "course_work_20")  # narx 10000
         self.assertTrue(result.ok)
         self.assertEqual(result.reason, "reserved")
         self.assertIsNotNone(result.reservation_id)
@@ -400,7 +483,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_failed_service_triggers_automatic_release(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         self.assertTrue(result.ok)
 
         ok = wallet.release_reservation(result.reservation_id, reason="AI xato qildi")
@@ -412,7 +495,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_insufficient_available_balance_blocks_reservation(self):
         wallet.credit_balance(1, 5000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")  # narx 10000
+        result = wallet.reserve_for_feature(1, "course_work_20")  # narx 10000
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "insufficient")
         self.assertEqual(result.available, 5000)
@@ -427,7 +510,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_expired_reservation_is_auto_released_and_frees_balance(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         # Muddatini sun'iy ravishda o'tkazib yuboramiz (orphaned/crash simulyatsiyasi).
         wallet._data["reservations"][result.reservation_id]["expires_at"] = "2000-01-01T00:00:00+00:00"
 
@@ -438,7 +521,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_duplicate_release_is_idempotent(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         first = wallet.release_reservation(result.reservation_id, reason="xato")
         second = wallet.release_reservation(result.reservation_id, reason="qayta urinish")
         third = wallet.release_reservation(result.reservation_id, reason="yana")
@@ -449,7 +532,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_duplicate_completion_does_not_double_debit(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         first = wallet.complete_reservation(result.reservation_id)
         second = wallet.complete_reservation(result.reservation_id)
         third = wallet.complete_reservation(result.reservation_id)
@@ -460,7 +543,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_cannot_release_already_completed_reservation(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         wallet.complete_reservation(result.reservation_id)
         ok = wallet.release_reservation(result.reservation_id, reason="kech qoldi")
         self.assertFalse(ok)
@@ -468,7 +551,7 @@ class ReservationBasicTests(unittest.TestCase):
 
     def test_cannot_complete_already_released_reservation(self):
         wallet.credit_balance(1, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         wallet.release_reservation(result.reservation_id, reason="xato")
         ok = wallet.complete_reservation(result.reservation_id)
         self.assertFalse(ok)
@@ -488,7 +571,7 @@ class ReservationConcurrencyTests(unittest.TestCase):
 
         def worker():
             try:
-                r = wallet.reserve_for_feature(1, "course_work")
+                r = wallet.reserve_for_feature(1, "course_work_20")
                 with lock:
                     results.append(r.ok)
             except wallet.WalletError:
@@ -510,7 +593,7 @@ class ReservationConcurrencyTests(unittest.TestCase):
         chaqiruvi "ko'rmaydi" (chunki debit_balance faqat balance'ga qaraydi) —
         LEKIN balans baribir hech qachon manfiy bo'lib qolmasligi kerak."""
         wallet.credit_balance(1, 10000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")  # 10000 band qilindi, available=0
+        result = wallet.reserve_for_feature(1, "course_work_20")  # 10000 band qilindi, available=0
         self.assertTrue(result.ok)
 
         # Parallel ravishda balansdan to'g'ridan-to'g'ri yechishga urinamiz.
@@ -544,7 +627,7 @@ class ReservationConcurrencyTests(unittest.TestCase):
         release HECH QACHON chaqirilmagan) holatni simulyatsiya qiladi —
         muddat o'tgach reservation avtomatik ozod bo'lishi SHART."""
         wallet.credit_balance(1, 10000, "boshlang'ich")
-        result = wallet.reserve_for_feature(1, "course_work")
+        result = wallet.reserve_for_feature(1, "course_work_20")
         self.assertEqual(wallet.get_available_balance(1), 0)
 
         # "Crash" simulyatsiyasi: process hech qachon complete/release chaqirmadi,
@@ -581,7 +664,7 @@ class DuplicatePaymentApprovalRefundAndConcurrencyTests(unittest.TestCase):
         yechilmagani uchun balans bir marta ham o'zgarmaydi, lekin muhimi —
         ikkinchi chaqiruv HECH NARSA qilmaydi)."""
         wallet.credit_balance(7, 20000, "boshlang'ich")
-        result = wallet.reserve_for_feature(7, "course_work")
+        result = wallet.reserve_for_feature(7, "course_work_20")
         balance_before = wallet.get_balance(7)
         first = wallet.release_reservation(result.reservation_id, reason="AI xato")
         second = wallet.release_reservation(result.reservation_id, reason="qayta urinish")
@@ -601,7 +684,7 @@ class DuplicatePaymentApprovalRefundAndConcurrencyTests(unittest.TestCase):
 
         def worker():
             barrier.wait()  # ikkalasi ham AYNAN bir vaqtda urinsin
-            r = wallet.reserve_for_feature(42, "course_work")
+            r = wallet.reserve_for_feature(42, "course_work_20")
             with lock:
                 outcomes.append(r.reason)
 
@@ -620,7 +703,7 @@ class DuplicatePaymentApprovalRefundAndConcurrencyTests(unittest.TestCase):
         (masalan admin to'lovni tasdiqlashi) kelsa — ikkalasi ham xavfsiz
         birgalikda ishlashi kerak (balans hech qachon buzilmasin)."""
         wallet.credit_balance(50, 10000, "boshlang'ich")
-        result = wallet.reserve_for_feature(50, "course_work")  # available=0
+        result = wallet.reserve_for_feature(50, "course_work_20")  # available=0
         self.assertTrue(result.ok)
 
         def credit_worker():
@@ -644,7 +727,7 @@ class DuplicatePaymentApprovalRefundAndConcurrencyTests(unittest.TestCase):
         """Bitta reservation'ni bir nechta thread PARALLEL ravishda release
         qilishga urinsa — faqat BITTASI muvaffaqiyatli bo'lishi kerak."""
         wallet.credit_balance(60, 10000, "boshlang'ich")
-        result = wallet.reserve_for_feature(60, "course_work")
+        result = wallet.reserve_for_feature(60, "course_work_20")
         outcomes = []
         lock = threading.Lock()
         barrier = threading.Barrier(10)
@@ -669,7 +752,7 @@ class DuplicatePaymentApprovalRefundAndConcurrencyTests(unittest.TestCase):
         complete (finalize) qilishga urinsa — balans FAQAT BIR MARTA
         kamayishi kerak (double debit himoyasi race condition ostida ham)."""
         wallet.credit_balance(70, 10000, "boshlang'ich")
-        result = wallet.reserve_for_feature(70, "course_work")
+        result = wallet.reserve_for_feature(70, "course_work_20")
         outcomes = []
         lock = threading.Lock()
         barrier = threading.Barrier(10)
@@ -692,3 +775,48 @@ class DuplicatePaymentApprovalRefundAndConcurrencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReferralRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        _reset_wallet_state()
+
+    def test_new_user_gets_welcome_bonus_only_once(self):
+        result = wallet.register_start(101)
+        self.assertEqual(result["welcome_bonus"], 10000)
+        self.assertEqual(wallet.get_balance(101), 10000)
+        again = wallet.register_start(101)
+        self.assertEqual(again["welcome_bonus"], 0)
+        self.assertEqual(wallet.get_balance(101), 10000)
+
+    def test_referral_credits_inviter_once_and_invitee_gets_welcome(self):
+        wallet.register_start(201)
+        first = wallet.register_start(202, referrer_id=201)
+        self.assertEqual(first["welcome_bonus"], 10000)
+        self.assertEqual(first["referral_bonus"], 5000)
+        self.assertEqual(wallet.get_balance(201), 15000)
+        self.assertEqual(wallet.get_balance(202), 10000)
+        wallet.register_start(202, referrer_id=201)
+        self.assertEqual(wallet.get_balance(201), 15000)
+        self.assertEqual(wallet.referral_stats(201)["invited"], 1)
+
+    def test_self_referral_and_unregistered_referrer_are_ignored(self):
+        self_result = wallet.register_start(301, referrer_id=301)
+        self.assertEqual(self_result["referral_bonus"], 0)
+        wallet.register_start(302, referrer_id=999)
+        self.assertEqual(wallet.get_balance(999), 0)
+
+    def test_legacy_wallet_does_not_get_new_user_bonus(self):
+        wallet.credit_balance(401, 2500, "legacy")
+        result = wallet.register_start(401)
+        self.assertEqual(result["welcome_bonus"], 0)
+        self.assertEqual(wallet.get_balance(401), 2500)
+
+    def test_previously_seen_user_does_not_get_welcome_or_referral_bonus(self):
+        wallet.register_start(501)
+        wallet.register_start(502, previously_seen=True)
+        result = wallet.register_start(502, referrer_id=501)
+        self.assertEqual(result["welcome_bonus"], 0)
+        self.assertEqual(result["referral_bonus"], 0)
+        self.assertEqual(wallet.get_balance(501), 10000)
+        self.assertEqual(wallet.get_balance(502), 0)

@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "uz.studentai.mobile"
     compileSdk = 34
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "uz.studentai.mobile"
@@ -13,7 +14,25 @@ android {
         targetSdk = 34
         // CI'da build raqami va commit qo'shiladi: APK qaysi koddan chiqqanini aniq bilish uchun.
         versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()?.plus(100) ?: 2
-        versionName = "1.1-login-fix" + (System.getenv("GITHUB_SHA")?.take(7)?.let { "-$it" } ?: "")
+        // Ko'proq Android telefonlariga mos universal APK.
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+
+        // CMake arguments belong under defaultConfig.externalNativeBuild.cmake.
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DLLAMA_CPP_SOURCE_DIR=${rootProject.projectDir.resolve("llama.cpp").absolutePath}",
+                    "-DGGML_OPENMP=OFF",
+                    "-DGGML_LLAMAFILE=OFF",
+                    "-DGGML_NATIVE=OFF",
+                    "-DLLAMA_BUILD_TESTS=OFF",
+                    "-DLLAMA_BUILD_EXAMPLES=OFF",
+                    "-DLLAMA_BUILD_SERVER=OFF"
+                )
+            }
+        }
+
+        versionName = "1.1." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0") + (System.getenv("GITHUB_SHA")?.take(7)?.let { "-$it" } ?: "")
 
         // 🔧 Botning HTTP serveri (bot.py) qaysi manzilda ochiq bo'lsa,
         // ilova SHU manzilga ulanadi. Render'ga deploy qilingandan keyin
@@ -22,7 +41,7 @@ android {
         // CI'da GitHub repo Variables (Settings > Secrets and variables > Actions > Variables)
         // ichida BASE_URL=https://SIZNING-SERVIS.onrender.com qilib berilsa, shu ishlatiladi.
         val baseUrl = (System.getenv("BASE_URL")?.trim()?.takeIf { it.startsWith("http") }
-            ?: "https://student-ai-uz.onrender.com").trimEnd('/') + "/"
+            ?: "https://student-flah.onrender.com").trimEnd('/') + "/"
         buildConfigField("String", "BASE_URL", "\"$baseUrl\"")
     }
 
@@ -54,6 +73,13 @@ android {
     buildFeatures {
         viewBinding = true
         buildConfig = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     compileOptions {

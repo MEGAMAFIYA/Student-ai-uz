@@ -16,7 +16,7 @@
 
   <section id="lobby" class="panel">
     <div class="hero"><div class="hero-orb">♟</div><div><h2>Do‘stingiz bilan o‘ynang</h2><p id="lobbyText">Xona ochilmoqda…</p></div></div>
-    <div class="choices">
+    <div id="lobbyChess" class="choices">
       <div><h3>1. Rangni tanlang</h3><div class="row">
         <button class="choice side" data-side="w">⚪ <b>Oq</b><span>birinchi yurish</span></button>
         <button class="choice side" data-side="b">⚫ <b>Qora</b><span>ikkinchi yurish</span></button>
@@ -27,6 +27,23 @@
         <button class="choice style" data-style="neon">◈ <b>Neon</b><span>zamonaviy</span></button>
       </div></div>
       <button id="readyBtn" class="primary" disabled>✓ Tanlovni tasdiqlash</button>
+    </div>
+    <div id="lobbyMemory" class="choices hidden">
+      <div><h3>1. Necha katakdan iborat bo‘lsin?</h3><div class="row" id="memSizeRow"></div></div>
+      <div><h3>2. Qanday belgilar bo‘lsin?</h3><div class="row" id="memSymbolsRow"></div></div>
+      <button id="memReadyBtn" class="primary">✓ Tayyor</button>
+      <p id="memReadyStatus" class="mem-ready-status"></p>
+    </div>
+    <div id="lobbyTTT" class="choices hidden">
+      <div><h3>Belgingizni tanlang</h3><div class="row">
+        <button class="choice mark" data-mark="x">❌ <b>X</b><span>birinchi yuradi</span></button>
+        <button class="choice mark" data-mark="o">⭕ <b>O</b><span>ikkinchi yuradi</span></button>
+      </div></div>
+      <button id="markReadyBtn" class="primary" disabled>✓ Tanlovni tasdiqlash</button>
+    </div>
+    <div id="lobbyQuoridor" class="choices hidden">
+      <p class="q-lobby-text">🧱 <b>Quoridor</b>: 9×9 doska, har kimda 10 ta devor. Raqibingiz shu xonaga kirishi bilan o‘yin avtomatik boshlanadi.</p>
+      <button id="qShareBtn" class="primary">📤 Do‘stga havola yuborish</button>
     </div>
     <div id="players" class="players"></div>
   </section>
@@ -44,7 +61,34 @@
       </div>
     </div>
 
-    <div class="boardWrap"><div id="board" class="board" aria-label="O‘yin doskasi"></div><div id="fx" class="fx"></div></div>
+    <div class="boardWrap"><div id="board" class="board" aria-label="O‘yin doskasi"></div><div id="qBoard" class="qboard hidden"></div><div id="fx" class="fx"></div>
+      <div id="promoPicker" class="promo-picker hidden">
+        <div class="promo-title">Kimga aylantirasiz?</div>
+        <div class="promo-row">
+          <button data-p="q" class="promo-choice">♛</button>
+          <button data-p="r" class="promo-choice">♜</button>
+          <button data-p="b" class="promo-choice">♝</button>
+          <button data-p="n" class="promo-choice">♞</button>
+        </div>
+      </div>
+    </div>
+    <div id="memScoreboard" class="mem-scoreboard hidden"></div>
+    <div id="qPanel" class="qpanel hidden">
+      <div id="qInfo" class="q-info"></div>
+      <div id="qModeRow" class="q-row">
+        <button id="qModeMove" class="tool q-mode">🚶 Yurish</button>
+        <button id="qModeWall" class="tool q-mode">🧱 Devor qo‘yish</button>
+        <button id="qRules" class="tool">📖 Qoidalar</button>
+      </div>
+      <div id="qWallRow" class="q-row hidden">
+        <button id="qOrH" class="tool q-or">↔️ Gorizontal</button>
+        <button id="qOrV" class="tool q-or">↕️ Vertikal</button>
+      </div>
+      <div id="qWallConfirm" class="q-row hidden">
+        <button id="qWallOk" class="primary q-ok" disabled>✅ Devorni qo‘yish</button>
+        <button id="qWallCancel" class="danger q-cancel">❌ Bekor qilish</button>
+      </div>
+    </div>
     <div class="actions">
       <button id="soundBtn" class="tool">🔊 Ovoz</button>
       <button id="callBtn" class="tool">📹 Kamera</button>
@@ -52,6 +96,7 @@
       <button id="resignBtn" class="danger">🏳 Taslim</button>
     </div>
     <div id="result" class="result hidden"></div>
+    <button id="rematchBtn" class="primary hidden">🔄 Qayta o‘ynash</button>
 
     <section class="chat game-chat">
       <div class="chat-title"><span>💬 Chat</span><span id="chatStatus" class="chat-status"></span></div>

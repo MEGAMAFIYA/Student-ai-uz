@@ -24,6 +24,7 @@ import uuid
 from datetime import datetime, timezone
 
 import config
+import hisobchi  # 🧮 admin hisobchi (faqat xotiraga yozadi)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ _UPSTASH_KEY = "student_ai_app_data"
 # funksiyalar ham sinxron (httpx.Client) ishlaydi va aiogram/PTB bir nechta
 # haqiqiy thread'da chaqirilishi mumkin bo'lgan sinxron kod ichida ishga
 # tushishi mumkin).
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 MAX_FILES_PER_USER = 30      # har bir foydalanuvchi uchun saqlanadigan fayllar tarixi chegarasi
 MAX_USAGE_DATES = 60         # statistikada saqlanadigan kunlar soni (eskilari siqiladi)
@@ -46,10 +47,15 @@ _DEFAULT_DATA = {
     "files": {},      # {"<user_id>": [{"type","title","file_id","ts"}, ...]}
     "usage": {},       # {"<func>": {"total": int, "unique_users": [ids], "by_date": {date: int}}}
     "all_users": [],   # botdan umuman foydalangan barcha noyob user_id'lar
+    "user_profiles": {},  # {"<user_id>": {"username","first_name","last_name","updated_at"}}
     "reminders": [],   # [{"id","user_id","chat_id","text","due_ts","created_ts"}]
     "groups": {},      # {"<chat_id>": {"active": bool}} — guruhda Universal chat holati
     "inline_logs": [],  # [{"ts","user_id","username","query","status","detail"}] — inline (@Bot ...) jurnali
     "movies": {},      # {"<movie_id>": {"id","title","file_id","mime_type","file_name","size","uploaded_by","created_ts"}} — kino katalogi
+    "keepalive": {},   # {"<render_service_id>": {"name","url","enabled_ts"}} — 😴 Render "Uxlamaslik" ro'yxati
+    "ads": {},         # {"<ad_id>": {"id","chat_id","chat_title","text","interval_min","created_by","created_ts"}} — 📢 guruh reklamalari
+    "course_image_prefs": {},
+    "render_pending_deploys": [],  # deploy ID va servis — tugagach admin xabari uchun  # {"<user_id>": {"enabled"?, "provider"?, "model"?, "count"?}} — 🖼 kurs ishi rasm sozlamalari (faqat foydalanuvchi tanlagan maydonlar)
 }
 
 
@@ -82,9 +88,16 @@ def _load() -> dict:
 _data = _load()
 
 
+def _snapshot() -> str:
+    with _lock:
+        return json.dumps(_data, ensure_ascii=False)
+
+
 def _save() -> None:
-    raw = json.dumps(_data, ensure_ascii=False)
-    config.persist_write(_DATA_FILENAME, _UPSTASH_KEY, raw, commit_message="📊 Foydalanuvchi fayllari/statistika/eslatmalar yangilandi")
+    """Kechiktirilgan yozish: handler (event loop) tashqi bazani kutib qotmaydi.
+    Bir necha o'zgarish bitta yozuvga birlashadi; chiqishda oxirgi holat yoziladi."""
+    config.persist_write_deferred(_DATA_FILENAME, _UPSTASH_KEY, _snapshot,
+                                  commit_message="📊 Foydalanuvchi fayllari/statistika/eslatmalar yangilandi")
 
 
 # ============================================================
@@ -101,6 +114,7 @@ def record_file(user_id: int, file_type: str, title: str, file_id: str) -> None:
         if len(lst) > MAX_FILES_PER_USER:
             del lst[: len(lst) - MAX_FILES_PER_USER]
         _save()
+    hisobchi.on_file(user_id, file_type, title)
     logger.info(f"🗂 Fayl tarixga qo'shildi: user_id={user_id}, turi={file_type}, sarlavha='{title[:60]}'.")
 
 
@@ -132,6 +146,49 @@ _FUNCTION_LABELS_FOR_STATS = {
 }
 
 
+def record_user(user_id: int, username: str = "", first_name: str = "", last_name: str = "") -> None:
+    """Bot bilan o'zaro aloqaga kirgan foydalanuvchini doimiy ro'yxatga oladi.
+
+    /developer > Moliya > Foydalanuvchilar uchun ID, @username va ism/familiyani
+    saqlaydi. Username keyinchalik o'zgarsa, yangi qiymat bilan yangilanadi.
+    """
+    uid = int(user_id)
+    with _lock:
+        profiles = _data.setdefault("user_profiles", {})
+        key = str(uid)
+        profile = {
+            "username": (username or "").lstrip("@")[:64],
+            "first_name": (first_name or "")[:128],
+            "last_name": (last_name or "")[:128],
+        }
+        old_profile = profiles.get(key) or {}
+        changed = uid not in _data["all_users"]
+        if uid not in _data["all_users"]:
+            _data["all_users"].append(uid)
+        if any(old_profile.get(k, "") != v for k, v in profile.items()):
+            profile["updated_at"] = _now_iso()
+            profiles[key] = profile
+            changed = True
+        elif key not in profiles:
+            profile["updated_at"] = _now_iso()
+            profiles[key] = profile
+            changed = True
+        if changed:
+            _save()
+
+
+def get_all_users() -> list[int]:
+    """Botdan foydalangan barcha foydalanuvchi IDlarini qaytaradi."""
+    with _lock:
+        return [int(uid) for uid in _data.get("all_users", [])]
+
+
+def get_user_profile(user_id: int) -> dict:
+    with _lock:
+        profile = _data.get("user_profiles", {}).get(str(int(user_id)), {})
+        return dict(profile)
+
+
 def record_usage(function_key: str, user_id: int) -> None:
     """Bir funksiyadan MUVAFFAQIYATLI foydalanilganda (masalan PDF tayyor
     bo'lganda) chaqiriladi. Global (bot bo'yicha) va shu funksiya bo'yicha
@@ -154,6 +211,7 @@ def record_usage(function_key: str, user_id: int) -> None:
                 del by_date[old_day]
 
         _save()
+    hisobchi.on_usage(function_key, user_id)
     logger.info(f"📊 Foydalanish qayd etildi: funksiya='{function_key}', user_id={user_id}.")
 
 
@@ -271,6 +329,106 @@ def remove_reminder(reminder_id: str) -> bool:
 
 
 # ============================================================
+# 📢 Guruh reklamalari (/developer > 📢 Reklama)
+# ============================================================
+# Faqat reklama sozlamasi saqlanadi (guruh, matn, interval). Oxirgi yuborilgan
+# vaqt ATAYLAB saqlanmaydi: har daqiqada yozuv yangilansa, GitHub/Neon
+# saqlashda keraksiz yuk va commitlar paydo bo'lardi.
+
+MAX_ADS = 50
+
+
+def add_ad(chat_id: int, chat_title: str, text: str, interval_min: int, created_by: int) -> dict:
+    with _lock:
+        if len(_data["ads"]) >= MAX_ADS:
+            raise ValueError(f"Faol reklamalar soni chegarasi ({MAX_ADS}) to'lgan.")
+        ad = {
+            "id": uuid.uuid4().hex[:10],
+            "chat_id": int(chat_id),
+            "chat_title": str(chat_title or "")[:120],
+            "text": str(text),
+            "interval_min": int(interval_min),
+            "created_by": int(created_by),
+            "created_ts": time.time(),
+        }
+        _data["ads"][ad["id"]] = ad
+        _save()
+    logger.info(f"📢 Yangi reklama qo'shildi: id={ad['id']}, chat_id={chat_id}, har {interval_min} daqiqada.")
+    return dict(ad)
+
+
+def get_ads() -> list[dict]:
+    with _lock:
+        return sorted((dict(a) for a in _data["ads"].values()), key=lambda a: a.get("created_ts", 0))
+
+
+def get_ad(ad_id: str) -> dict | None:
+    with _lock:
+        ad = _data["ads"].get(str(ad_id))
+        return dict(ad) if ad else None
+
+
+def update_ad(ad_id: str, **fields) -> dict | None:
+    with _lock:
+        ad = _data["ads"].get(str(ad_id))
+        if not ad:
+            return None
+        ad.update(fields)
+        _save()
+        return dict(ad)
+
+
+def remove_ad(ad_id: str) -> bool:
+    with _lock:
+        removed = _data["ads"].pop(str(ad_id), None) is not None
+        if removed:
+            _save()
+    if removed:
+        logger.info(f"📢 Reklama o'chirildi: id={ad_id}.")
+    return removed
+
+
+# ============================================================
+# 😴 Render "Uxlamaslik" (keep-alive) ro'yxati
+# ============================================================
+# /developer > RENDER > servis > 😴 Uxlamaslik orqali yoqilgan servislar.
+# render_keepalive.py shu ro'yxatdagi URL larga har 5 daqiqada so'rov yuboradi.
+# Faqat yoqish/o'chirish saqlanadi (oxirgi ping natijasi xotirada turadi).
+
+def set_keepalive(service_id: str, name: str, url: str) -> dict:
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("Uxlamaslik uchun to'g'ri http(s) URL kerak")
+    with _lock:
+        item = {"name": str(name)[:120], "url": str(url), "enabled_ts": time.time()}
+        _data["keepalive"][str(service_id)] = item
+        _save()
+    logger.info(f"😴 Uxlamaslik yoqildi: {name} ({service_id}).")
+    return dict(item)
+
+
+def remove_keepalive(service_id: str) -> bool:
+    with _lock:
+        removed = _data["keepalive"].pop(str(service_id), None) is not None
+        if removed:
+            _save()
+    if removed:
+        logger.info(f"😴 Uxlamaslik o'chirildi: {service_id}.")
+    return removed
+
+
+def get_keepalive(service_id: str) -> dict | None:
+    with _lock:
+        item = _data["keepalive"].get(str(service_id))
+        return dict(item) if item else None
+
+
+def get_all_keepalive() -> dict:
+    with _lock:
+        return {sid: dict(item) for sid, item in _data["keepalive"].items()}
+
+
+# ============================================================
 # 👥 Guruhlarda Universal chat holati
 # ============================================================
 # STANDART HOLAT — FAOL (True). Bot yangi guruhga qo'shilganda yoki
@@ -362,6 +520,7 @@ def update_movie(movie_id: str, **fields) -> dict | None:
             "telegram_chat_id", "telegram_message_id",
             "telegram_file_unique_id", "telegram_document_id",
             "telegram_access_hash", "telegram_file_reference",
+            "variants",   # {"480": {telegram_chat_id, telegram_message_id, size, mime_type}, ...}
         }
         for key, value in fields.items():
             if key in allowed:
@@ -396,3 +555,67 @@ def search_movies(query: str = "") -> list[dict]:
 
 def count_movies() -> int:
     return len(_data.get("movies", {}))
+
+
+# ============================================================
+# 🖼 Kurs ishi rasm sozlamalari (foydalanuvchi tanlovi)
+# ============================================================
+# Faqat foydalanuvchi AYNAN tanlagan maydonlar saqlanadi — qolganlari uchun
+# administrator standarti (config.COURSE_IMAGE_DEFAULTS) ishlaydi, shuning
+# uchun admin keyinchalik standartni o'zgartirsa, tanlamagan foydalanuvchilarga
+# avtomatik ta'sir qiladi.
+
+_COURSE_IMAGE_PREF_FIELDS = ("enabled", "provider", "model", "count")
+
+
+def get_course_image_prefs(user_id: int) -> dict:
+    with _lock:
+        prefs = _data.get("course_image_prefs", {}).get(str(int(user_id)), {})
+        return {k: v for k, v in prefs.items() if k in _COURSE_IMAGE_PREF_FIELDS}
+
+
+def set_course_image_prefs(user_id: int, **fields) -> dict:
+    """Berilgan maydonlarni yangilaydi (None qiymat — maydonni olib tashlaydi,
+    ya'ni admin standartiga qaytadi). Qaytaradi: yangi saqlangan prefs."""
+    with _lock:
+        store = _data.setdefault("course_image_prefs", {})
+        prefs = dict(store.get(str(int(user_id)), {}))
+        for k, v in fields.items():
+            if k not in _COURSE_IMAGE_PREF_FIELDS:
+                continue
+            if v is None:
+                prefs.pop(k, None)
+            else:
+                prefs[k] = v
+        if prefs:
+            store[str(int(user_id))] = prefs
+        else:
+            store.pop(str(int(user_id)), None)
+        _save()
+        return dict(prefs)
+
+
+
+def add_render_pending_deploy(service_id: str, deploy_id: str, service_name: str = "") -> None:
+    if not service_id or not deploy_id:
+        return
+    with _lock:
+        items = _data.setdefault("render_pending_deploys", [])
+        if not any(str(x.get("deploy_id")) == str(deploy_id) for x in items):
+            items.append({"service_id": str(service_id), "deploy_id": str(deploy_id),
+                          "service_name": str(service_name or "Render service")[:100], "created_ts": time.time()})
+            _data["render_pending_deploys"] = items[-50:]
+            # Deploy botning o'zini qayta ishga tushirishi mumkin: kuzatuv yozuvi
+            # restartdan oldin albatta tashqi saqlashga yetib borishi kerak.
+            config.persist_write(_DATA_FILENAME, _UPSTASH_KEY, _snapshot(),
+                                 commit_message="☁️ Render deploy kuzatuvi saqlandi")
+
+def get_render_pending_deploys() -> list[dict]:
+    with _lock:
+        return [dict(x) for x in _data.get("render_pending_deploys", []) if isinstance(x, dict)]
+
+def finish_render_pending_deploy(deploy_id: str) -> None:
+    with _lock:
+        _data["render_pending_deploys"] = [x for x in _data.get("render_pending_deploys", [])
+            if str(x.get("deploy_id")) != str(deploy_id)]
+        _save()

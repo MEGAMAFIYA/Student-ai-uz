@@ -1,9 +1,13 @@
 """
 🔑 Foydalanuvchining SHAXSIY AI kalitlari.
 
-Format config.KEY_POOLS bilan BIR XIL: {"<provider>": [{"key","model"}, ...]}
-— shuning uchun ai_clients.py'dagi mavjud _dispatch()/provider mantig'ini
-qayta ishlatish mumkin (duplicate yo'q).
+Format:
+    {"keys": {"<provider>": [{"key","model"}, ...]}, "al_yordamchi": {...}}
+Old format (faqat provider kalitlari) ham backward-compatible.
+`al_yordamchi` foydalanuvchining yordamchi sozlamalari va xotira DB ulanishini
+saqlaydi. AL API kalitlari alohida config.AL_USER_KEYS saqlash joyida, egasi
+Telegram ID bo'yicha bog'langan holda saqlanadi; bot funksiyalarining KEY_POOLS
+kalitlari AL Yordamchi uchun hech qachon ishlatilmaydi.
 
 FARQI: bular botning UMUMIY kalitlaridan (config.KEY_POOLS, /developer
 orqali boshqariladi) MUSTAQIL — har bir foydalanuvchi FAQAT o'zining
@@ -13,6 +17,9 @@ GitHub'da botning umumiy holatidan (GITHUB_DATA_DIR) ALOHIDA, shaxsiy
 
     {MENING_KABINETIM_DIR}/{user_id}/mening_kalitlarim.json
 
+AL Yordamchi kalitlari botning boshqa funksiyalar kalitlaridan alohida runtime
+konfiguratsiyada saqlanadi va doimiy backend orqali deploydan keyin tiklanadi.
+
 Ishlatilish tartibi (ai_clients.ask_ai_with_source): pullik funksiya
 chaqirilganda AVVAL shu yerdagi kalitlar sinaladi, ULAR ISHLAMASA
 botning umumiy kalitiga (yoki zaxira provayderlarga) o'tiladi.
@@ -20,47 +27,119 @@ botning umumiy kalitiga (yoki zaxira provayderlarga) o'tiladi.
 
 import json
 import logging
+import threading
+from functools import wraps
 
 import config
 
 logger = logging.getLogger(__name__)
+
+_USER_WRITE_LOCKS = {}
+_USER_WRITE_LOCKS_GUARD = threading.Lock()
+
+def _serialized_user_write(func):
+    """Bitta foydalanuvchi JSON fayliga parallel read-modify-write'larni ketma-ket bajaradi."""
+    @wraps(func)
+    def wrapper(user_id, *args, **kwargs):
+        uid = int(user_id)
+        with _USER_WRITE_LOCKS_GUARD:
+            lock = _USER_WRITE_LOCKS.setdefault(uid, threading.RLock())
+        with lock:
+            return func(uid, *args, **kwargs)
+    return wrapper
 
 
 def _path(user_id: int) -> str:
     return f"{config.MENING_KABINETIM_DIR}/{user_id}/mening_kalitlarim.json"
 
 
-def get_pools(user_id: int) -> dict:
-    """{"<provider>": [{"key","model"}, ...]} — hech narsa bo'lmasa yoki
-    GitHub sozlanmagan bo'lsa bo'sh lug'at."""
+def _read_data(user_id: int) -> dict:
+    """Shaxsiy faylning yangi/eskirgan formatini yagona ko'rinishga keltiradi."""
     raw = config.github_read_text_file(_path(user_id))
     if not raw:
-        return {}
+        return {"keys": {}, "al_yordamchi": {}}
     try:
         data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.error(f"🔑 Foydalanuvchi kalitlarini o'qishda JSON xato (user_id={user_id}): {e}")
-        return {}
+        return {"keys": {}, "al_yordamchi": {}}
+    if not isinstance(data, dict):
+        return {"keys": {}, "al_yordamchi": {}}
+    if "keys" in data or "al_yordamchi" in data:
+        keys = data.get("keys", {})
+        assistant = data.get("al_yordamchi", {})
+        return {
+            "keys": keys if isinstance(keys, dict) else {},
+            "al_yordamchi": assistant if isinstance(assistant, dict) else {},
+        }
+    # Eski format: {"gemini": [...], "groq": [...]}
+    return {"keys": data, "al_yordamchi": {}}
+
+
+def get_pools(user_id: int) -> dict:
+    """{"<provider>": [{"key","model"}, ...]} — faqat oddiy shaxsiy AI kalitlari."""
+    return _read_data(user_id)["keys"]
+
+
+def get_assistant_config(user_id: int) -> dict:
+    """AL YORDAMCHI sozlamalari; maxfiy API kaliti config.AL_USER_KEYS'da turadi."""
+    cfg = dict(_read_data(user_id).get("al_yordamchi") or {})
+    cfg.pop("key", None)
+    return cfg
+
+
+@_serialized_user_write
+def save_assistant_config(user_id: int, values: dict) -> bool:
+    """AL YORDAMCHI konfiguratsiyasini mavjud shaxsiy kalitlarni buzmasdan saqlaydi."""
+    data = _read_data(user_id)
+    assistant = dict(values or {})
+    assistant.pop("key", None)
+    data["al_yordamchi"] = assistant
+    return _save_all(user_id, data, f"🤖 AL YORDAMCHI sozlamalari yangilandi: user_id={user_id}")
+
+
+@_serialized_user_write
+def update_assistant_config(user_id: int, **updates) -> bool:
+    data = _read_data(user_id)
+    cfg = dict(data.get("al_yordamchi") or {})
+    cfg.update(updates)
+    return save_assistant_config(user_id, cfg)
+
+def get_text_pools(user_id: int) -> dict:
+    """Faqat MATN AI provayderlari (config.SUPPORTED_PROVIDERS) kalitlari —
+    rasm provayderlari (bfl/stability) bu yerga kirmaydi, chunki ular matn
+    so'rovlarida ishlatilmaydi."""
+    return {p: pool for p, pool in get_pools(user_id).items() if p in config.SUPPORTED_PROVIDERS}
+
+
+def get_image_pools(user_id: int) -> dict:
+    """Faqat RASM provayderlari (config.IMAGE_PROVIDERS) kalitlari."""
+    return {p: pool for p, pool in get_pools(user_id).items() if p in config.IMAGE_PROVIDERS and pool}
 
 
 def has_any_keys(user_id: int) -> bool:
-    return any(pool for pool in get_pools(user_id).values())
+    """Foydalanuvchida MATN AI uchun shaxsiy kalit bormi (50% qaytarish
+    mantig'i faqat matn kalitlariga bog'liq — rasm kalitlari buni o'zgartirmaydi)."""
+    return any(pool for pool in get_text_pools(user_id).values())
 
 
-def _save_pools(user_id: int, pools: dict, message: str) -> bool:
-    """GitHub'ga yozadi va MUVAFFAQIYAT/MUVAFFAQIYATSIZLIKNI qaytaradi —
-    chaqiruvchi funksiyalar (add_key/update_key_field/delete_key) shu
-    natijani albatta tekshirib, foydalanuvchiga FAQAT haqiqatda saqlangan
-    bo'lsa muvaffaqiyat xabarini ko'rsatishi kerak (qarang:
-    handlers/my_cabinet.py)."""
-    raw = json.dumps(pools, ensure_ascii=False, indent=2)
+@_serialized_user_write
+def _save_all(user_id: int, data: dict, message: str) -> bool:
+    raw = json.dumps(data, ensure_ascii=False, indent=2)
     ok = config.github_write_text_file(_path(user_id), raw, message=message)
     if not ok:
         logger.error(f"🔑 Foydalanuvchi kalitlari GitHub'ga YOZILMADI (user_id={user_id}): {message}")
     return ok
 
 
+@_serialized_user_write
+def _save_pools(user_id: int, pools: dict, message: str) -> bool:
+    """Oddiy shaxsiy kalitlarni saqlaydi va AL YORDAMCHI sozlamalarini asraydi."""
+    data = _read_data(user_id)
+    data["keys"] = pools
+    return _save_all(user_id, data, message)
+
+@_serialized_user_write
 def add_key(user_id: int, provider: str, api_key: str, model: str) -> tuple[int, bool]:
     """Yangi kalitni MAVJUD to'plamga (boshqa provayderlar/kalitlar
     saqlanib qolgan holda) ro'yxat oxiriga qo'shadi.
@@ -82,6 +161,7 @@ def add_key(user_id: int, provider: str, api_key: str, model: str) -> tuple[int,
     return last_index, False
 
 
+@_serialized_user_write
 def update_key_field(user_id: int, provider: str, index: int, field: str, value: str) -> bool:
     """`index` — 1 dan boshlanadi (foydalanuvchiga ko'rsatiladigan
     raqamlash bilan bir xil). Qaytaradi: MUVAFFAQIYATLI saqlandimi
@@ -94,6 +174,7 @@ def update_key_field(user_id: int, provider: str, index: int, field: str, value:
     return _save_pools(user_id, pools, f"🔑 Shaxsiy AI kaliti yangilandi: user_id={user_id}, provider={provider}#{index}")
 
 
+@_serialized_user_write
 def delete_key(user_id: int, provider: str, index: int) -> bool:
     """Qaytaradi: MUVAFFAQIYATLI o'chirilib, saqlandimi."""
     pools = get_pools(user_id)

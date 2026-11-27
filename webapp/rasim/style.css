@@ -40,6 +40,9 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  /* Telegram Mini App tepasidagi yopish (X) paneli bilan to'qnashmaslik
+     uchun ilova kontentining yuqorisida doimiy bo'sh zona. */
+  padding-top: 58px;
 }
 
 button { font-family: inherit; }
@@ -347,6 +350,7 @@ button { font-family: inherit; }
   padding-bottom: 8px;
   min-height: 16px;
   flex-shrink: 0;
+  white-space: pre-line;
 }
 
 /* ============================================================

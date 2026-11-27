@@ -7,6 +7,8 @@ ko'rinishga qisqartiradi.
 import asyncio
 import logging
 
+from cancel_registry import cancel_markup
+
 from telegram import Update, InputFile
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode, ChatAction
@@ -46,6 +48,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📑 *Konspekt qisqartirish*\n\nQisqartirilishi kerak bo'lgan matnni yozing YOKI PDF faylni yuboring.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_markup(),
         )
     except Exception as e:
         logger.error(f"📑 Konspekt menyusini ochishda xato (user_id={user.id if user else '?'}): {type(e).__name__}: {e}", exc_info=True)
@@ -83,7 +86,7 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"📑 Konspekt so'rovi: chat_id={chat_id}, manba={source_desc}, uzunlik={len(text)} belgi.")
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    status = await update.message.reply_text("⏳ Konspekt tuzilmoqda...")
+    status = await update.message.reply_text("⏳ Konspekt tuzilmoqda...", reply_markup=cancel_markup())
 
     summary = await ask_ai(SUMMARY_AI, text, _SYSTEM)
 
@@ -110,8 +113,8 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_document(
             chat_id, document=InputFile(pdf_buf, filename="konspekt.pdf"),
             caption="📑 Konspekt (uzun bo'lgani uchun PDF qilib berildi).",
-            reply_markup=main_menu_keyboard(),
         )
+        await context.bot.send_message(chat_id, "🏠 Bosh menyu:", reply_markup=main_menu_keyboard())
         if user_id and msg.document:
             storage.record_file(user_id, "summarize", "Konspekt", msg.document.file_id)
 

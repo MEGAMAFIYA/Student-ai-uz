@@ -9,6 +9,8 @@ bosqichma-bosqich, tushunarli tarzda beriladi.
 import asyncio
 import logging
 
+from cancel_registry import cancel_markup
+
 from telegram import Update, InputFile
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode, ChatAction
@@ -47,6 +49,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Masalani MATN qilib yozing YOKI uning RASMINI (fotosuratini) yuboring "
             "— qo'lda yozilgan yoki kitobdan olingan bo'lsa ham bo'ladi.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_markup(),
         )
     except Exception as e:
         logger.error(f"🧮 Masala yechish menyusini ochishda xato (user_id={user.id if user else '?'}): {type(e).__name__}: {e}", exc_info=True)
@@ -61,7 +64,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"🧮 Masala so'rovi (matn): chat_id={chat_id}, uzunlik={len(problem)} belgi.")
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    status = await update.message.reply_text("⏳ Masala yechilmoqda...")
+    status = await update.message.reply_text("⏳ Masala yechilmoqda...", reply_markup=cancel_markup())
 
     solution = await ask_ai(SOLVE_AI, problem, _SYSTEM)
     await _send_solution(update, context, status, "Masala (matn)", solution, chat_id, user_id)
@@ -75,7 +78,7 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"🧮 Masala so'rovi (rasm): chat_id={chat_id}.")
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    status = await update.message.reply_text("⏳ Rasmdagi masala tahlil qilinmoqda...")
+    status = await update.message.reply_text("⏳ Rasmdagi masala tahlil qilinmoqda...", reply_markup=cancel_markup())
 
     photo = update.message.photo[-1]  # eng yuqori sifatdagi versiya
     file = await context.bot.get_file(photo.file_id)
@@ -119,8 +122,8 @@ async def _send_solution(update, context, status_msg, label, solution, chat_id, 
         msg = await context.bot.send_document(
             chat_id, document=InputFile(pdf_buf, filename="masala_yechimi.pdf"),
             caption="🧮 Yechim (javob uzun bo'lgani uchun PDF qilib berildi).",
-            reply_markup=main_menu_keyboard(),
         )
+        await context.bot.send_message(chat_id, "🏠 Bosh menyu:", reply_markup=main_menu_keyboard())
         if user_id and msg.document:
             storage.record_file(user_id, "solve", "Masala yechimi", msg.document.file_id)
 

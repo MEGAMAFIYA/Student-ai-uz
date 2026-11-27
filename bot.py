@@ -21,10 +21,12 @@ from threading import Thread, Timer
 from urllib.parse import urlparse, parse_qs
 
 import telegram.error
-from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats, BotCommandScopeChat, InlineQueryResultPhoto
+from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats, BotCommandScopeChat, InlineQueryResultPhoto
 import business_storage
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -33,24 +35,33 @@ from telegram.ext import (
     ChosenInlineResultHandler,
     ChatMemberHandler,
     BusinessConnectionHandler,
+    TypeHandler,
     filters,
 )
 
 import config
+import hisobchi
+import storage
 from config import TELEGRAM_TOKEN, PUBLIC_BASE_URL
 import pending_input
+import cancel_registry
 import wallet
-import payment_providers
 import webapp_security
+import mobile_auth
+import mobile_api
 import inline_media
 import movie_watch
+import museum
+import render_keepalive
 import game
+import chat_games
 import drawing_game
+from handlers import business_autoreply, al_yordamchi
 from handlers import (
-    menu, universal_chat, course_work, translate as translate_handler, images_to_pdf,
+    menu, universal_chat, course_work, ai_image, translate as translate_handler, images_to_pdf,
     edit_pdf, guide, inline_query, developer, pptx_gen, essay, quiz, solve, summarize, managed_tests,
     grammar, citation, my_files, reminders, voice, wallet_ui, tabrik, rasim,
-    vid, qoshiq, kino, mention_dispatch, pro_tabrik, my_cabinet,
+    vid, qoshiq, kino, hisobchi_cmd, mention_dispatch, pro_tabrik, my_cabinet, payment_notify, payment_auto,
 )
 from pdf_tools import make_pdf
 
@@ -67,11 +78,93 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+business_logger = logging.getLogger("business_autoreply")
+
+# Telegram Business Auto Reply uchun alohida aylanuvchi log fayli.
+# Shu yozuvlar stdout'ga ham chiqadi (Render/Replit loglarida ko'rinadi).
+try:
+    from logging.handlers import RotatingFileHandler
+    os.makedirs("logs", exist_ok=True)
+    _business_log_handler = RotatingFileHandler(
+        os.getenv("BUSINESS_AUTOREPLY_LOG_FILE", "logs/business_autoreply.log"),
+        maxBytes=3 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    _business_log_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    ))
+    _business_logger = business_logger
+    _business_logger.setLevel(logging.INFO)
+    if not any(
+        isinstance(h, RotatingFileHandler)
+        and getattr(h, "baseFilename", "").endswith("business_autoreply.log")
+        for h in _business_logger.handlers
+    ):
+        _business_logger.addHandler(_business_log_handler)
+    _business_logger.propagate = True
+    _business_logger.info("BUSINESS_AUTOREPLY_LOGGER_READY file=%s",
+                          _business_log_handler.baseFilename)
+
+    _al_logger = logging.getLogger("al_yordamchi")
+    _al_logger.setLevel(logging.INFO)
+    _al_log_handler = RotatingFileHandler(
+        os.getenv("AL_YORDAMCHI_LOG_FILE", "logs/al_yordamchi.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _al_log_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    ))
+    if not any(
+        isinstance(h, RotatingFileHandler)
+        and getattr(h, "baseFilename", "").endswith("al_yordamchi.log")
+        for h in _al_logger.handlers
+    ):
+        _al_logger.addHandler(_al_log_handler)
+    _al_logger.propagate = True
+    _al_logger.info("AL_YORDAMCHI_LOGGER_READY file=%s", _al_log_handler.baseFilename)
+except Exception:
+    logger.exception("BUSINESS_AUTOREPLY_FILE_LOGGER_INIT_FAILED; stdout logging remains active")
+
+
+async def _track_user_message(update, context):
+    """Har qanday oddiy Telegram xabaridan foydalanuvchi profilini saqlaydi.
+    Handler block=False bo'lgani uchun asosiy funksiyalarni kutdirmaydi."""
+    user = getattr(update, "effective_user", None)
+    if not user:
+        return
+    # /start oldidan ro'yxatni tekshirish imkonini beramiz: shu sababli
+    # /start xabari aynan shu handlerda oldindan qayd etilmaydi.
+    message = getattr(update, "message", None)
+    first_token = str(getattr(message, "text", "") or "").split(maxsplit=1)[:1]
+    if message and first_token and (first_token[0].lower() == "/start" or first_token[0].lower().startswith("/start@")):
+        return
+    try:
+        storage.record_user(
+            user.id,
+            getattr(user, "username", "") or "",
+            getattr(user, "first_name", "") or "",
+            getattr(user, "last_name", "") or "",
+        )
+    except Exception as exc:
+        logger.debug("Foydalanuvchi profilini saqlashda xato: %s", exc)
+
+
+async def _track_user_callback(update, context):
+    await _track_user_message(update, context)
+
+
+async def _track_user_inline(update, context):
+    await _track_user_message(update, context)
+
 
 BOT_COMMANDS = [
     BotCommand("start", "Botni ishga tushirish / asosiy menyu"),
     BotCommand("tabrik", "🎁 Chiroyli tabrik xabari yuborish"),
     BotCommand("rasim", "🎨 Mini App orqali rasm chizish"),
+    BotCommand("muzey", "🏛 3D xotiralar muzeyi"),
     BotCommand("vid", "🎬 Video yuklab olish (havola bilan)"),
     # Eslatma: Telegram "/" buyruqlar ro'yxatida apostrofli nomlarga ruxsat
     # bermaydi, shuning uchun shu yerda ASCII "qoshiq" ko'rsatiladi — lekin
@@ -92,8 +185,26 @@ async def _post_init(application):
     BUNGA QO'SHILMAYDI — u faqat config.ADMIN_IDS ichidagi foydalanuvchilarning
     shaxsiy '/' menyusida (BotCommandScopeChat orqali) alohida ko'rsatiladi,
     boshqa hech kimga (oddiy foydalanuvchi yoki guruhlarga) ko'rinmaydi."""
-    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
-    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+    # 🖼 Slayd previewlarini fon oqimida oldindan tayyorlash (bot ishga tushishini kechiktirmaydi).
+    if os.getenv("SLIDE_PREVIEW_PREWARM", "1").lower() in ("1", "true", "yes"):
+        try:
+            import threading
+            import slide_previews
+            threading.Thread(target=slide_previews.prewarm, name="slide-preview-prewarm", daemon=True).start()
+        except Exception as e:
+            logger.warning(f"🖼 Preview prewarm ishga tushmadi (muhim emas): {e}")
+
+    logger.info("BOT_POST_INIT_START business_auto_reply_diagnostics=enabled")
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+        logger.info("BOT_DEFAULT_COMMANDS_SET_OK count=%s", len(BOT_COMMANDS))
+    except Exception:
+        logger.exception("BOT_DEFAULT_COMMANDS_SET_FAILED")
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        logger.info("BOT_GROUP_COMMANDS_SET_OK count=%s", len(BOT_COMMANDS))
+    except Exception:
+        logger.exception("BOT_GROUP_COMMANDS_SET_FAILED")
 
     # 🧭 "@Bot /vid ..." kabi mention orqali kelgan buyruqlarni aniqlash
     # uchun HAQIQIY (Telegram tomonidan tasdiqlangan) bot username kerak —
@@ -104,11 +215,19 @@ async def _post_init(application):
         if me and me.username:
             mention_dispatch.set_bot_username(me.username)
             drawing_game.set_bot_username(me.username)
+            try:
+                import game as _game_mod
+                _game_mod.set_bot_username(me.username)
+            except Exception:
+                pass
     except Exception as e:
         logger.warning(f"🧭 Bot username'ni get_me() orqali olishda xato (fallback ishlatiladi): {e}")
 
     if config.ADMIN_IDS:
-        admin_commands = BOT_COMMANDS + [BotCommand("developer", "🔧 AI sozlamalari (faqat admin)")]
+        admin_commands = BOT_COMMANDS + [
+            BotCommand("developer", "🔧 AI sozlamalari (faqat admin)"),
+            BotCommand("hisobchi", "🧮 Bot hisoboti (faqat admin)"),
+        ]
         for admin_id in config.ADMIN_IDS:
             try:
                 await application.bot.set_my_commands(
@@ -125,6 +244,66 @@ async def _post_init(application):
     except Exception as e:
         logger.error(f"⏰ Eslatmalarni qayta rejalashtirishda xato: {type(e).__name__}: {e}", exc_info=True)
 
+    # ☁️ Deploy xabarnomasi: bot o'z deployi sabab qayta ishga tushgan bo'lsa,
+    # storage'da qolgan deploy kuzatuvlarini qayta tiklaymiz.
+    try:
+        developer.resume_render_deploy_notifications(application)
+    except Exception as e:
+        logger.error("☁️ Deploy kuzatuvini tiklashda xato: %s", e, exc_info=True)
+
+    # 😴 Render "Uxlamaslik": /developer > RENDER orqali yoqilgan servislarga
+    # har 5 daqiqada so'rov yuborib turadigan fon tsikli (ro'yxat storage'da
+    # saqlanadi, shuning uchun deploy/restartdan keyin ham davom etadi).
+    try:
+        render_keepalive.start()
+    except Exception as e:
+        logger.error(f"😴 Render keep-alive tsiklini ishga tushirishda xato: {type(e).__name__}: {e}", exc_info=True)
+
+    # 📢 Guruh reklamalari (/developer > 📢 Reklama): saqlangan hammasini tiklaymiz.
+    try:
+        from handlers import ads as ads_scheduler
+        ads_scheduler.reschedule_all(application)
+    except Exception as e:
+        logger.error(f"📢 Reklamalarni qayta rejalashtirishda xato: {type(e).__name__}: {e}", exc_info=True)
+
+    # 🤖 Bot ishga tushganda (har qayta deployda ham) storage'da saqlangan
+    # BARCHA 'auto_hold' to'lovlarni qayta rejalashtiramiz — shu orqali
+    # 1 soatlik avtomatik qabul muddati deploy/restart paytida yo'qolmaydi
+    # (handlers/payment_auto.py'dagi izohga qarang).
+    try:
+        payment_auto.reschedule_all(application)
+    except Exception as e:
+        logger.error(f"🤖 To'lovlarni qayta rejalashtirishda xato: {type(e).__name__}: {e}", exc_info=True)
+
+
+    # Bot yangilangandan keyin avvaldan ulangan Business akkauntlari uchun
+    # /bossiyons menyu buyrug'ini ham qayta tiklaymiz.
+    try:
+        active_connections = business_storage.get_active_connections()
+        business_logger.info("BUSINESS_STARTUP_RESTORE_BEGIN active_connections=%s",
+                    len(active_connections))
+        for connection in active_connections:
+            owner_id = connection.get("user_id")
+            connection_id = connection.get("connection_id")
+            if owner_id:
+                business_logger.info(
+                    "BUSINESS_STARTUP_RESTORE_CONNECTION user_id=%s connection_id=%s",
+                    owner_id, connection_id,
+                )
+                ok = await business_autoreply.ensure_command_visible(
+                    application.bot, int(owner_id)
+                )
+                business_logger.info(
+                    "BUSINESS_STARTUP_RESTORE_RESULT user_id=%s success=%s",
+                    owner_id, ok,
+                )
+            else:
+                business_logger.error("BUSINESS_STARTUP_RESTORE_SKIP reason=MISSING_USER_ID entry=%s",
+                             {k: v for k, v in connection.items() if k != "connection_id"})
+        business_logger.info("BUSINESS_STARTUP_RESTORE_FINISHED")
+    except Exception as e:
+        business_logger.exception("BUSINESS_STARTUP_RESTORE_FAILED error=%s", e)
+
 
 async def _on_business_message(update, context):
     """📨 Connected Business account chatidagi incoming xabarni qayd etadi.
@@ -135,13 +314,29 @@ async def _on_business_message(update, context):
     peerning haqiqiy chat_id'sini oldindan saqlab boramiz.
     """
     message = update.business_message
-    if message is None or not message.business_connection_id or not message.chat:
+    if message is None:
+        business_logger.warning("BUSINESS_MESSAGE_UPDATE_EMPTY update_id=%s", update.update_id)
+        return
+    business_logger.info(
+        "BUSINESS_MESSAGE_UPDATE_RECEIVED update_id=%s connection_id=%s chat_id=%s chat_type=%s",
+        update.update_id, getattr(message, "business_connection_id", None),
+        getattr(getattr(message, "chat", None), "id", None),
+        getattr(getattr(message, "chat", None), "type", None),
+    )
+    if not message.business_connection_id or not message.chat:
+        business_logger.error("BUSINESS_MESSAGE_UPDATE_INVALID update_id=%s", update.update_id)
         return
     business_storage.record_business_message(
         message.business_connection_id,
         message.chat.id,
         getattr(message, "date", None),
     )
+    # AL YORDAMCHI yoqilgan foydalanuvchida u eski statik auto-reply'dan
+    # ustun turadi. True qaytsa, update boshqa Business javobiga o'tmaydi.
+    handled_by_ai = await al_yordamchi.process_business_message(message, context)
+    if handled_by_ai:
+        return
+    await business_autoreply.process_business_message(message, context)
 
 
 async def _on_business_connection(update, context):
@@ -152,10 +347,70 @@ async def _on_business_connection(update, context):
     """
     conn = update.business_connection
     if conn is None:
+        business_logger.error("BUSINESS_CONNECTION_UPDATE_EMPTY update_id=%s", update.update_id)
         return
-    business_storage.save_connection(conn)
-    if not conn.is_enabled:
-        logger.info(f"📇 BUSINESS_CONNECTION_DISABLED user_id={conn.user.id} connection_id={conn.id}")
+    business_logger.info(
+        "BUSINESS_CONNECTION_UPDATE_RECEIVED update_id=%s user_id=%s connection_id=%s "
+        "is_enabled=%s rights=%s",
+        update.update_id, getattr(conn.user, "id", None), conn.id,
+        conn.is_enabled, getattr(conn, "rights", None),
+    )
+    try:
+        business_storage.save_connection(conn)
+        business_logger.info(
+            "BUSINESS_CONNECTION_PERSISTED user_id=%s connection_id=%s enabled=%s",
+            conn.user.id, conn.id, conn.is_enabled,
+        )
+    except Exception:
+        business_logger.exception(
+            "BUSINESS_CONNECTION_PERSIST_FAILED user_id=%s connection_id=%s",
+            conn.user.id, conn.id,
+        )
+        raise
+    if conn.is_enabled:
+        ok = await business_autoreply.ensure_command_visible(context.bot, conn.user.id)
+        business_logger.info(
+            "BUSINESS_CONNECTION_COMMAND_MENU_RESULT user_id=%s success=%s",
+            conn.user.id, ok,
+        )
+    else:
+        business_logger.warning(
+            "BUSINESS_CONNECTION_DISABLED user_id=%s connection_id=%s",
+            conn.user.id, conn.id,
+        )
+
+
+async def _intercept_pro_test_answer(update, context):
+    """🛡️ \"/test pro\" javobini HAR QANDAY boshqa handlerdan OLDIN ushlaydi.
+
+    MUAMMO: botdagi 15+ ta ConversationHandler'ning birortasida ham
+    `conversation_timeout` yo'q — ya'ni foydalanuvchi biror wizard'ni
+    (masalan /tabrik, /rasim, /vid, /pptx va h.k.) boshlab, TUGATMASDAN
+    tashlab ketsa, o'sha holat o'sha (chat, user) juftligi uchun ABADIY
+    \"faol\" bo'lib qoladi. ConversationHandler'lar bu botda
+    `MessageHandler(filters.TEXT & ~filters.COMMAND, ...)`dan foydalanadi —
+    demak keyinchalik yuborilgan HAR QANDAY oddiy matn (jumladan \"test
+    pro\" rejimidagi savolga javob) o'sha eski, aloqasiz wizard holatiga
+    \"yutilib\" ketadi va handlers/managed_tests.py hech qachon uni
+    ko'rmaydi (buning uchun handlers/universal_chat.py hatto chaqirilmaydi,
+    chunki ConversationHandler'lar bot.py'da undan OLDIN, group=0'da
+    ro'yxatdan o'tgan — PTB har bir guruhda faqat BIRINCHI mos handlerni
+    ishlatadi).
+
+    YECHIM: shu handler group=-1 (ya'ni barcha group=0 handlerlardan,
+    jumladan barcha ConversationHandler'lardan OLDIN) ishlaydi. Agar
+    foydalanuvchi aynan \"test pro\" javobini kutayotgan bo'lsa — javob
+    shu yerda ushlanadi va ApplicationHandlerStop bilan pastdagi barcha
+    handlerlar (jumladan eskirib qolgan ConversationHandler holati)
+    to'liq o'tkazib yuboriladi, shu bilan javob ikki marta qayta
+    ishlanishining (yoki umuman ko'rinmay qolishining) oldi olinadi.
+    Aks holda (kutilayotgan javob yo'q) — hech narsa qilmaydi, xabar
+    odatdagidek pastga (group=0) o'tadi."""
+    if not update.message or not update.effective_user:
+        return
+    if managed_tests.is_waiting_text_answer(context):
+        await managed_tests.handle_pro_text_answer(update, context)
+        raise ApplicationHandlerStop
 
 
 async def _clear_pending_on_other_command(update, context):
@@ -172,6 +427,18 @@ async def _clear_pending_on_other_command(update, context):
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     pending_input.clear_pending(update.effective_chat.id, update.effective_user.id)
+
+
+async def _al_private_text_router(update, context):
+    """AL setup yoki AL private chat xabarini boshqa AI handlerlariga o'tkazmaydi."""
+    handled = await al_yordamchi.receive_setup_text(update, context)
+    if handled:
+        logger.info(
+            "AL_SETUP_INPUT_CONSUMED update_id=%s user_id=%s; downstream_handlers=STOPPED",
+            getattr(update, "update_id", None),
+            getattr(getattr(update, "effective_user", None), "id", None),
+        )
+        raise ApplicationHandlerStop
 
 
 async def _error_handler(update, context):
@@ -203,6 +470,25 @@ async def _error_handler(update, context):
 
 _PLACEHOLDER_PDF_BYTES: bytes = b""
 _PLACEHOLDER_PDF_PATH = "/placeholder.pdf"
+# 🎨 Inline "rasm ..." uchun vaqtinchalik rasm (InlineQueryResultPhoto URL talab qiladi).
+_PLACEHOLDER_IMG_BYTES: bytes = b""
+_PLACEHOLDER_IMG_PATH = "/placeholder.png"
+
+
+def _build_placeholder_png() -> bytes:
+    try:
+        import io as _io
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (512, 512), (42, 111, 176))
+        d = ImageDraw.Draw(img)
+        d.ellipse((176, 176, 336, 336), outline=(255, 255, 255), width=10)
+        d.polygon([(226, 216), (226, 296), (296, 256)], fill=(255, 255, 255))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        logger.error(f"Placeholder rasm yaratishda xato: {e}")
+        return b""
 
 # ============================================================
 # 💎 Inline "/pro" boshlang'ich audio xabari uchun (pro_tabrik_business.py)
@@ -288,10 +574,9 @@ def _build_music_icon_png() -> bytes:
 # ============================================================
 # 🎨 /rasim MINI APP — statik fayllarni xizmat qilish + rasm yuklash
 # ============================================================
-# MUHIM: bu HTTP server ALOHIDA OS thread'da ishlaydi (yuqoridagi
-# Kapitalbank webhook izohiga qarang), lekin rasmni Telegram'ga
-# YUBORISH uchun asyncio Bot obyekti (asosiy event loop) kerak — shuning
-# uchun `_MAIN_LOOP`/`_BOT_INSTANCE` global o'zgaruvchilarga `main()`
+# MUHIM: bu HTTP server ALOHIDA OS thread'da ishlaydi, lekin rasmni
+# Telegram'ga YUBORISH uchun asyncio Bot obyekti (asosiy event loop) kerak —
+# shuning uchun `_MAIN_LOOP`/`_BOT_INSTANCE` global o'zgaruvchilarga `main()`
 # ichida `app`/`loop` tayyor bo'lgach yoziladi, bu yerdan esa
 # `asyncio.run_coroutine_threadsafe()` orqali xavfsiz chaqiriladi.
 _MAIN_LOOP = None
@@ -429,17 +714,28 @@ def _handle_draw_api(handler: "HealthHandler") -> None:
     rid = str(payload.get("room") or rid)
     init_data = str(payload.get("init_data") or init_data)
     if path == "/api/draw/submit":
+        logger.info(
+            "🎨 DRAW_API_SUBMIT_REQUEST room=%s init_data=%s payload_image=%s",
+            rid, "present" if init_data else "missing", "present" if payload.get("image") else "missing",
+        )
         image = str(payload.get("image") or "")
         m = re.fullmatch(r"data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=]+)", image)
         if not m:
+            logger.error("🎨 DRAW_API_SUBMIT_REJECT room=%s reason=invalid_image_data_url", rid)
             reply(400, error="Rasm formati noto'g'ri."); return
         try:
             image_bytes = base64.b64decode(m.group(1), validate=True)
-        except Exception:
+        except Exception as e:
+            logger.error("🎨 DRAW_API_SUBMIT_DECODE_ERROR room=%s type=%s detail=%s", rid, type(e).__name__, e, exc_info=True)
             reply(400, error="Rasmni o'qib bo'lmadi."); return
         result, err = drawing_game.submit(rid, init_data, image_bytes)
         if result is None:
+            logger.error("🎨 DRAW_API_SUBMIT_REJECT room=%s reason=%s", rid, err or "unknown")
             reply(400, error=err or "Rasm yuborilmadi."); return
+        logger.info(
+            "🎨 DRAW_API_SUBMIT_ACCEPTED room=%s user_id=%s bytes=%d",
+            rid, result["user_id"], len(image_bytes),
+        )
 
         # Direct/Main Mini App user-user chatga answerWebAppQuery bilan
         # to'g'ridan-to'g'ri xabar yubora olmaydi. Shuning uchun rasmni Telegram
@@ -452,26 +748,37 @@ def _handle_draw_api(handler: "HealthHandler") -> None:
         with open(file_path, "wb") as f:
             f.write(jpeg)
         photo_url = f"{PUBLIC_BASE_URL}{_WEBAPP_GENERATED_URL_PREFIX}{filename}"
-        caption = result.get("caption", "")
 
-        if result.get("evaluate"):
-            prompt, img1, img2 = result["evaluate"]
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    drawing_game._evaluate(prompt, img1, img2), _MAIN_LOOP
-                )
-                evaluation = future.result(timeout=100)
-            except Exception as e:
-                logger.error("🎨 Drawing duel evaluation xato: %s", e, exc_info=True)
-                evaluation = {
-                    "player1": None,
-                    "player2": None,
-                    "winner": None,
-                    "comment": "AI vaqtida javob bermadi.",
-                }
-            room = drawing_game.finish_evaluation(rid, evaluation)
-            if room:
-                caption = drawing_game._telegram_caption(evaluation, room)
+        # 🎯 HAR bir topshirish uchun (birinchi bo'lsin, ikkinchi bo'lsin)
+        # AI shu rasmni DARHOL, do'stini kutmasdan, mustaqil baholaydi —
+        # shu bilan "Berilgan shart: X / O'xshashi: Y%" rasm ostida
+        # HAR DOIM chiqadi (avval faqat 2-chi rasm kelgach chiqar edi).
+        prompt, img = result["single_eval"]
+        logger.info(
+            "🎨 DRAW_EVAL_DISPATCH room=%s user_id=%s prompt=%r",
+            rid, result["user_id"], prompt,
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                drawing_game._evaluate_single(prompt, img), _MAIN_LOOP
+            )
+            score = future.result(timeout=max(130, int(os.getenv("DRAW_EVAL_TIMEOUT_SEC", "130"))))
+        except Exception as e:
+            logger.error("🎨 DRAW_EVAL_EXCEPTION room=%s user_id=%s type=%s detail=%s", rid, result["user_id"], type(e).__name__, e, exc_info=True)
+            score = {
+                "score": None,
+                "comment": "AI vaqtida javob bermadi.",
+                "ai_status": "timeout_or_exception",
+                "ai_detail": f"{type(e).__name__}: {e}"[:300],
+            }
+        logger.info(
+            "🎨 DRAW_EVAL_DONE room=%s user_id=%s status=%s score=%s detail=%s",
+            rid, result["user_id"], score.get("ai_status"), score.get("score"), score.get("ai_detail"),
+        )
+
+        room, caption, summary = drawing_game.finish_single_evaluation(rid, str(result["user_id"]), score)
+        if not caption:
+            caption = f"🎯 Berilgan shart: {prompt}"
 
         async def _prepare():
             prepared = InlineQueryResultPhoto(
@@ -489,6 +796,7 @@ def _handle_draw_api(handler: "HealthHandler") -> None:
                 allow_channel_chats=False,
             )
 
+        logger.info("🎨 DRAW_SHARE_PREPARE_START room=%s user_id=%s", rid, result["user_id"])
         try:
             future = asyncio.run_coroutine_threadsafe(_prepare(), _MAIN_LOOP)
             prepared = future.result(timeout=30)
@@ -496,13 +804,26 @@ def _handle_draw_api(handler: "HealthHandler") -> None:
             if not prepared_id:
                 raise RuntimeError("Telegram PreparedInlineMessage ID qaytarmadi.")
         except Exception as e:
-            logger.error("🎨 Drawing duel PreparedInlineMessage xato: %s", e, exc_info=True)
+            logger.error("🎨 DRAW_SHARE_PREPARE_ERROR room=%s user_id=%s type=%s detail=%s", rid, result["user_id"], type(e).__name__, e, exc_info=True)
             try:
                 os.remove(file_path)
             except OSError:
                 pass
             reply(502, error="Rasmni Telegram ulashish oynasiga tayyorlab bo'lmadi.")
             return
+
+        logger.info("🎨 DRAW_SHARE_PREPARE_SUCCESS room=%s user_id=%s prepared_id=%s", rid, result["user_id"], prepared_id)
+
+        # 🏆 Yakuniy natija Mini App status API orqali ko'rsatiladi.
+        # Inline rejimda bot foydalanuvchiga o'z-o'zidan private xabar yubora
+        # olmaydi (Forbidden: bot can't initiate conversation with a user).
+        # Shuning uchun send_message bilan majburan yuborish o'rniga frontend
+        # polling orqali natijani oladi.
+        if summary:
+            logger.info(
+                "🎨 DRAW_DUEL_SUMMARY_READY room=%s user_id=%s other_user_id=%s",
+                rid, result["user_id"], result.get("other_user_id"),
+            )
 
         Timer(
             _WEBAPP_GENERATED_TTL_SEC,
@@ -511,9 +832,9 @@ def _handle_draw_api(handler: "HealthHandler") -> None:
         reply(
             200,
             data={
-                "state": result["state"],
+                "state": (room and drawing_game.public_state(room, str(result["user_id"]))) or result["state"],
                 "status": "submitted",
-                "both_submitted": bool(result.get("evaluate")),
+                "both_submitted": bool(summary),
                 "prepared_message_id": prepared_id,
             },
         )
@@ -732,6 +1053,10 @@ def _serve_kino_router(handler: "HealthHandler") -> bool:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if museum.handle_get(self, TELEGRAM_TOKEN):
+            return
+        if mobile_api.handle_get(self):
+            return
         if self.path == _PLACEHOLDER_PDF_PATH and _PLACEHOLDER_PDF_BYTES:
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
@@ -756,6 +1081,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=86400")
             self.end_headers()
             self.wfile.write(_PRO_AUDIO_BYTES)
+            return
+
+        if self.path == _PLACEHOLDER_IMG_PATH and _PLACEHOLDER_IMG_BYTES:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(_PLACEHOLDER_IMG_BYTES)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(_PLACEHOLDER_IMG_BYTES)
             return
 
         if self.path.startswith(inline_media.URL_PREFIX):
@@ -890,16 +1224,6 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
             return
-
-        if self.path.startswith("/api/kino/stream/"):
-            stream_key = self.path.split("/api/kino/stream/", 1)[1].split("?", 1)[0]
-            parts = stream_key.split("/")
-            if len(parts) == 2:
-                movie_watch.serve_movie_head(self, parts[0], parts[1])
-            else:
-                self.send_response(404)
-                self.end_headers()
-            return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -908,8 +1232,15 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self):
-        """💳 Kapitalbank to'lov webhook'i VA 🎨 /rasim Mini App rasm
-        yuklash so'rovi shu yerga keladi."""
+        if museum.handle_post(self, TELEGRAM_TOKEN):
+            return
+        if mobile_api.handle_post(self):
+            return
+
+        # 🎨 /rasim Mini App rasm yuklash so'rovi shu yerga keladi
+        # (to'lov endi Kapitalbank webhook'i orqali EMAS — chek + bot
+        # tekshiruvi orqali amalga oshadi: handlers/wallet_ui.py va
+        # handlers/payment_auto.py ga qarang).
         if self.path.startswith("/api/draw/"):
             _handle_draw_api(self)
             return
@@ -926,57 +1257,83 @@ class HealthHandler(BaseHTTPRequestHandler):
             _handle_rasim_upload(self)
             return
 
-        if self.path != "/webhook/kapitalbank":
-            self.send_response(404)
-            self.end_headers()
-            return
+        self.send_response(404)
+        self.end_headers()
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            raw_body = self.rfile.read(length) if length > 0 else b""
-            headers = {k: v for k, v in self.headers.items()}
 
-            provider = payment_providers.get_ecommerce_provider()
-            if not provider.verify_webhook_signature(headers, raw_body):
-                logger.warning("💳 Kapitalbank webhook: imzo tekshiruvidan o'tmadi yoki sozlanmagan — rad etildi.")
-                self.send_response(403)
-                self.end_headers()
-                self.wfile.write(b'{"status":"invalid_signature"}')
-                return
+async def _museum_command(update, context):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    user = update.effective_user
+    if not user:
+        return
+    url = museum.museum_command_url(PUBLIC_BASE_URL)
+    if not url:
+        await update.effective_message.reply_text("⚠️ Muzey Mini App manzili sozlanmagan. PUBLIC_BASE_URL ni Render sozlamalariga kiriting.")
+        return
+    await update.effective_message.reply_text(
+        "🏛 Xotiralar muzeyi\n\nShaxsiy 3D muzey yarating, suratlaringizni devorlarga joylang va do‘stingizni taklif qilib, bir xonada birga sayr qiling.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏛 Muzeyni ochish", web_app=WebAppInfo(url=url))]])
+    )
 
-            event = provider.parse_webhook(raw_body)
-            if not event.ok:
-                logger.error(f"💳 Kapitalbank webhook: parse xato — {event.error}")
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'{"status":"parse_error"}')
-                return
 
-            if event.status == "success":
-                if event.provider_transaction_id:
-                    try:
-                        wallet.register_provider_transaction(event.payment_id, provider.name, event.provider_transaction_id)
-                    except wallet.DuplicateTransactionError as e:
-                        logger.warning(f"💳 Kapitalbank webhook: DUPLICATE tranzaksiya — {e}")
-                        self.send_response(200)
-                        self.end_headers()
-                        self.wfile.write(b'{"status":"already_used"}')
-                        return
-                wallet.confirm_payment(event.payment_id, actor_id="kapitalbank_webhook", source="webhook")
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-        except Exception as e:
-            logger.error(f"💳 Kapitalbank webhook qayta ishlashda xato: {type(e).__name__}: {e}", exc_info=True)
-            self.send_response(500)
-            self.end_headers()
+async def _chat_game_callback(update, context):
+    q = update.callback_query
+    if not q or not q.data or not q.data.startswith("cg:"): return
+    parts = q.data.split(":")
+    try: action, rid = parts[1], parts[2]
+    except Exception:
+        await q.answer("O‘yin tugmasi noto‘g‘ri.", show_alert=True); return
+    user=q.from_user; room=chat_games._room(rid)
+    if not room:
+        await q.answer("O‘yin xonasi topilmadi yoki muddati o‘tgan.", show_alert=True); return
+    try:
+        if action == "join":
+            if room.get("game") == "quoridor": ok,err=chat_games.quoridor_join(room,user.id,user)
+            else: ok,err=chat_games.add_player(room,user.id,user)
+        elif action == "side":
+            ok,err=chat_games.add_player(room,user.id,user)
+            if ok and room.get("status") == "lobby": ok,err=chat_games.choose_side(room,user.id,parts[3])
+        elif action == "mark":
+            ok,err=chat_games.add_player(room,user.id,user)
+            if ok and room.get("status") == "lobby": ok,err=chat_games.choose_mark(room,user.id,parts[3])
+        elif action == "c": ok,err=chat_games.checkers_move(room,user.id,int(parts[3]),int(parts[4]))
+        elif action == "t": ok,err=chat_games.ttt_move(room,user.id,int(parts[3]))
+        elif action == "msize": ok,err=chat_games.memory_config(room,user.id,"size",parts[3])
+        elif action == "msym": ok,err=chat_games.memory_config(room,user.id,"symbols",parts[3])
+        elif action == "mmode": ok,err=chat_games.memory_set_mode(room,user.id,parts[3])
+        elif action == "mteam": ok,err=chat_games.memory_join_team(room,user.id,user,parts[3])
+        elif action == "mready": ok,err=chat_games.memory_ready(room,user.id)
+        elif action == "mf": ok,err=chat_games.memory_flip(room,user.id,int(parts[3]))
+        elif action == "restart": ok,err=chat_games.restart_room(room,user.id)
+        elif action == "refresh": ok,err=True,None
+        elif action in chat_games.Q_ACTIONS: ok,err=chat_games.quoridor_dispatch(room,user,action,parts[3:])
+        else: ok,err=False,"Noma’lum o‘yin tugmasi."
+    except Exception:
+        logger.exception("Chat game callback xatosi")
+        ok,err=False,"O‘yinda texnik xato yuz berdi."
+    if not ok:
+        await q.answer(err or "Amal bajarilmadi.", show_alert=True); return
+    text,kb=chat_games.render(room)
+    try: await q.edit_message_text(text,reply_markup=kb,parse_mode="HTML")
+    except Exception as e:
+        # "message is not modified" — oddiy holat (masalan, Yangilash); boshqa xatolar jurnalga yoziladi.
+        if "not modified" not in str(e).lower():
+            logger.warning("Chat game edit_message_text xatosi (game=%s): %s", room.get("game"), e)
+    await q.answer("✅" if action!="refresh" else "Yangilandi")
+    # Xotira o'yinida mos kelmagan juftlik 1 soniya ko'rinadi, so'ng yopiladi.
+    # Shu orada server memory_waiting orqali boshqa yurishlarni rad etadi.
+    if action == "mf" and room.get("memory_waiting"):
+        await asyncio.sleep(1.0)
+        if chat_games.memory_hide_mismatch(room):
+            text,kb=chat_games.render(room)
+            try: await q.edit_message_text(text,reply_markup=kb,parse_mode="HTML")
+            except Exception: pass
 
 
 def start_health_server():
-    global _PLACEHOLDER_PDF_BYTES, _MUSIC_ICON_PNG_BYTES, _PRO_AUDIO_BYTES
+    global _PLACEHOLDER_PDF_BYTES, _MUSIC_ICON_PNG_BYTES, _PRO_AUDIO_BYTES, _PLACEHOLDER_IMG_BYTES
     _PLACEHOLDER_PDF_BYTES = _build_placeholder_pdf()
+    _PLACEHOLDER_IMG_BYTES = _build_placeholder_png()
     _MUSIC_ICON_PNG_BYTES = _build_music_icon_png()
     _PRO_AUDIO_BYTES = _load_pro_audio_bytes()
     try:
@@ -986,6 +1343,43 @@ def start_health_server():
         server.serve_forever()
     except Exception as e:
         logger.error(f"HTTP server xatosi: {e}", exc_info=True)
+
+
+# ============================================================
+# ❌ BEKOR QILISH (markaziy)
+# ============================================================
+
+def _cancel_fallbacks(command_callback=None):
+    """Har bir ConversationHandler uchun bir xil fallback'lar: /cancel buyrug'i VA har bir
+    xabar ostidagi '❌ Bekor qilish' tugmasi (callback_data="cancel:all")."""
+    return [
+        CommandHandler("cancel", command_callback or menu.cancel_cmd),
+        CallbackQueryHandler(menu.cancel_cb, pattern=r"^cancel:all$"),
+    ]
+
+
+class CancellableApplication(Application):
+    """Har bir update'ni qayta ishlayotgan vazifani (asyncio.Task) cancel_registry'da qayd etadi —
+    shu orqali '❌ Bekor qilish' / /cancel ishlab turgan jarayonning o'zini ham to'xtata oladi
+    (faqat user_data tozalanib, vazifa davom etib ketmaydi)."""
+
+    async def process_update(self, update):
+        chat_id = user_id = None
+        try:
+            chat = getattr(update, "effective_chat", None)
+            user = getattr(update, "effective_user", None)
+            chat_id = chat.id if chat else None
+            user_id = user.id if user else None
+        except Exception:
+            pass
+        task = asyncio.current_task() if user_id is not None else None
+        if task is not None:
+            cancel_registry.track(chat_id, user_id, task)
+        try:
+            await super().process_update(update)
+        finally:
+            if task is not None:
+                cancel_registry.untrack(chat_id, user_id, task)
 
 
 # ============================================================
@@ -1007,7 +1401,7 @@ def build_kino_conv():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, kino.kino_receive_title),
             ],
         },
-        fallbacks=[CommandHandler("cancel", kino.kino_cancel)],
+        fallbacks=_cancel_fallbacks(kino.kino_cancel),
         name="kino_conv",
         allow_reentry=True,
     )
@@ -1015,12 +1409,22 @@ def build_kino_conv():
 
 def build_course_work_conv():
     return ConversationHandler(
-        entry_points=[CallbackQueryHandler(wallet_ui.require_payment("course_work")(course_work.entry), pattern="^menu:course_work$")],
+        # 💰 To'lov bu yerda emas — bet soni va rasm soni tanlangach, mavzu
+        # yuborilganda (course_work.receive_topic_and_generate) band qilinadi.
+        entry_points=[CallbackQueryHandler(course_work.entry, pattern="^menu:course_work$")],
         states={
-            course_work.CW_PAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, course_work.receive_pages)],
-            course_work.CW_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, course_work.receive_topic_and_generate)],
+            course_work.CW_PAGES: [CallbackQueryHandler(course_work.pages_chosen, pattern="^cwpages:")],
+            course_work.CW_TOPIC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, course_work.receive_topic_and_generate),
+                CallbackQueryHandler(course_work.img_settings_callback, pattern="^cwimg:"),
+                CallbackQueryHandler(course_work.upload_open, pattern="^cwup:open$"),
+            ],
+            course_work.CW_UPLOAD: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, course_work.upload_receive),
+                CallbackQueryHandler(course_work.upload_done, pattern="^cwup:(confirm|cancel)$"),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="course_work_conv",
         allow_reentry=True,
     )
@@ -1040,7 +1444,7 @@ def build_translate_conv():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, translate_handler.custom_lang_chosen)
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="translate_conv",
         allow_reentry=True,
     )
@@ -1055,7 +1459,7 @@ def build_images_pdf_conv():
                 CallbackQueryHandler(images_to_pdf.confirm, pattern="^imgpdf:confirm$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="images_pdf_conv",
         allow_reentry=True,
     )
@@ -1068,7 +1472,7 @@ def build_edit_pdf_conv():
             edit_pdf.EP_WAIT_PDF: [MessageHandler(filters.Document.PDF, edit_pdf.receive_pdf)],
             edit_pdf.EP_WAIT_INSTRUCTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_pdf.receive_instruction)],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="edit_pdf_conv",
         allow_reentry=True,
     )
@@ -1083,20 +1487,34 @@ def build_guide_conv():
                 CallbackQueryHandler(guide.finish, pattern="^guide:finish$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="guide_conv",
         allow_reentry=True,
     )
 
 
 def build_pptx_conv():
+    # Slayd ustasi: har bir tanlov bosqichi VIZUAL NAMUNA (callback_data "px:<bosqich>:<amal>:<indeks>").
+    # Har bir bosqich o'z holatida ro'yxatdan o'tgan; fallbacks: bekor qilish va eskirgan tugmalar.
     return ConversationHandler(
         entry_points=[CallbackQueryHandler(wallet_ui.require_payment("pptx")(pptx_gen.entry), pattern="^menu:pptx$")],
         states={
             pptx_gen.PX_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, pptx_gen.receive_topic)],
-            pptx_gen.PX_COUNT: [CallbackQueryHandler(pptx_gen.receive_count, pattern="^pptx:count:")],
+            pptx_gen.PX_COUNT: [CallbackQueryHandler(pptx_gen.receive_count, pattern=r"^px:cnt:")],
+            pptx_gen.PX_DESIGN: [CallbackQueryHandler(pptx_gen.choose_design, pattern=r"^px:dsg:")],
+            pptx_gen.PX_FRAME: [CallbackQueryHandler(pptx_gen.choose_frame, pattern=r"^px:frm:")],
+            pptx_gen.PX_PALETTE: [CallbackQueryHandler(pptx_gen.choose_palette, pattern=r"^px:pal:")],
+            pptx_gen.PX_CUSTOM_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, pptx_gen.receive_custom_color)],
+            pptx_gen.PX_FONT: [CallbackQueryHandler(pptx_gen.choose_font, pattern=r"^px:fnt:")],
+            pptx_gen.PX_CONFIRM: [CallbackQueryHandler(pptx_gen.choose_export, pattern=r"^pptx:pdf:")],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=[
+            # Rasmli xabar uchun maxsus bekor qilish (matnni tahrirlab bo'lmaydi) — umumiyidan OLDIN turadi.
+            CallbackQueryHandler(pptx_gen.cancel_cb, pattern=r"^cancel:all$"),
+            *_cancel_fallbacks(),
+            # Boshqa bosqichdan qolgan eskirgan tugma — bot yiqilmaydi, holat o'zgarmaydi.
+            CallbackQueryHandler(pptx_gen.stale_cb, pattern=r"^(px|pptx):"),
+        ],
         name="pptx_conv",
         allow_reentry=True,
     )
@@ -1110,7 +1528,7 @@ def build_essay_conv():
             essay.ES_PAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, essay.receive_pages)],
             essay.ES_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, essay.receive_topic_and_generate)],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="essay_conv",
         allow_reentry=True,
     )
@@ -1126,7 +1544,7 @@ def build_quiz_conv():
                 CallbackQueryHandler(quiz.receive_answer, pattern="^quiz:ans:"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="quiz_conv",
         allow_reentry=True,
     )
@@ -1141,7 +1559,7 @@ def build_solve_conv():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, solve.receive_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="solve_conv",
         allow_reentry=True,
     )
@@ -1155,7 +1573,7 @@ def build_summarize_conv():
                 MessageHandler((filters.TEXT | filters.Document.PDF) & ~filters.COMMAND, summarize.receive_content),
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="summarize_conv",
         allow_reentry=True,
     )
@@ -1167,7 +1585,7 @@ def build_grammar_conv():
         states={
             grammar.GR_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, grammar.receive_text)],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="grammar_conv",
         allow_reentry=True,
     )
@@ -1185,7 +1603,7 @@ def build_citation_conv():
                 CallbackQueryHandler(citation.finish, pattern="^cite:finish$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="citation_conv",
         allow_reentry=True,
     )
@@ -1202,17 +1620,18 @@ def build_reminders_conv():
             reminders.RM_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminders.receive_text)],
             reminders.RM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminders.receive_time)],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="reminders_conv",
         allow_reentry=True,
     )
 
 
 def build_wallet_topup_conv():
-    """➕ Balansni to'ldirish — summa tanlash -> to'lov usuli -> (bank/manual
-    uchun) chek qabul qilish. E-commerce usulida chek kutish shart emas —
-    to'lov havolasi ko'rsatilgach conversation darhol tugaydi (haqiqiy
-    to'lov Kapitalbank'ning o'z sahifasida, webhook orqali tasdiqlanadi)."""
+    """➕ Balansni to'ldirish — summa tanlash -> to'lov usuli -> chek qabul
+    qilish. "Chek yuborish" usulida bot chekni o'zi tekshiradi (karta/ism/
+    summa) va mos kelsa admin javobini yoki 1 soatlik avtomatik qabulni
+    kutadi; "To'g'ridan admin tekshiradi" usulida bot tekshiruvi
+    o'tkazilmaydi (to'g'ridan-to'g'ri manual_review)."""
     return ConversationHandler(
         entry_points=[CallbackQueryHandler(wallet_ui.entry_topup, pattern="^menu:wallet_topup$")],
         states={
@@ -1221,7 +1640,7 @@ def build_wallet_topup_conv():
             wallet_ui.WT_METHOD: [CallbackQueryHandler(wallet_ui.method_chosen, pattern="^wallet:method:")],
             wallet_ui.WT_RECEIPT: [MessageHandler(filters.PHOTO | filters.Document.ALL, wallet_ui.receive_receipt)],
         },
-        fallbacks=[CommandHandler("cancel", menu.cancel_cmd)],
+        fallbacks=_cancel_fallbacks(),
         name="wallet_topup_conv",
         allow_reentry=True,
     )
@@ -1254,8 +1673,12 @@ def build_developer_conv():
                 MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, developer.on_github_input),
                 CallbackQueryHandler(developer.on_callback, pattern="^dev:"),
             ],
+            developer.DEV_WAIT_ENVPDF: [
+                MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, developer.on_env_pdf_input),
+                CallbackQueryHandler(developer.on_callback, pattern="^dev:"),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", developer.cancel)],
+        fallbacks=_cancel_fallbacks(developer.cancel),
         name="developer_conv",
         # allow_reentry=True: agar admin /developer buyrug'ini istalgan
         # bosqichda (masalan "yangi kalit yuboring" kutib turganida) qayta
@@ -1301,6 +1724,7 @@ def main():
 
     app = (
         ApplicationBuilder()
+        .application_class(CancellableApplication)
         .token(TELEGRAM_TOKEN)
         .concurrent_updates(CONCURRENT_UPDATES)
         .connect_timeout(60)
@@ -1335,6 +1759,25 @@ def main():
     global _MAIN_LOOP, _BOT_INSTANCE
     _MAIN_LOOP = loop
     _BOT_INSTANCE = app.bot
+    mobile_api.set_application(app, loop)
+
+    # 👥 Moliya > Foydalanuvchilar uchun barcha bot foydalanuvchilarini
+    # doimiy qayd etamiz. Profil (username/ism) keyinchalik admin ro'yxatida
+    # ko'rsatiladi; handler block=False bo'lgani uchun asosiy oqimni kutdirmaydi.
+    # 🧮 Hisobchi: har bir update uchun AI-iz (trace). block=True, lekin faqat xotirada
+    # kichik lug'at yaratadi (mikrosekund) — hech narsani kutmaydi va hech qachon xato bermaydi.
+    app.add_handler(TypeHandler(Update, hisobchi_cmd.begin_trace), group=-3)
+    app.add_handler(MessageHandler(filters.ALL, _track_user_message, block=False), group=-2)
+    app.add_handler(CallbackQueryHandler(_chat_game_callback, pattern=r"^cg:", block=True), group=0)
+    app.add_handler(CallbackQueryHandler(_track_user_callback, pattern=".*", block=False), group=-2)
+    app.add_handler(InlineQueryHandler(_track_user_inline, block=False), group=-2)
+
+    # 🛡️ "test pro" javobini BARCHA ConversationHandler'lardan (group=0)
+    # OLDIN ushlaydi — aks holda eskirib qolgan/tugallanmagan boshqa
+    # wizard holati bu javobni "yutib" yuborishi mumkin edi (qarang:
+    # _intercept_pro_test_answer izohi). ApplicationHandlerStop tufayli
+    # javob faqat BIR MARTA qayta ishlanadi.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _intercept_pro_test_answer), group=-1)
 
     # ⏳ "/qoshiq"/"/vid" ikki bosqichli kiritishning kutish holatini
     # BOSHQA istalgan buyruq kelganda bekor qiladi — group=-1 bo'lgani
@@ -1344,6 +1787,19 @@ def main():
 
     app.add_handler(CommandHandler("start", menu.start_cmd))
     app.add_handler(CommandHandler("cancel", menu.cancel_cmd))
+    # Telegram Business Auto Reply — faqat Business akkaunt egasining bot bilan
+    # shaxsiy chatida sozlanadi; javoblar incoming BUSINESS_MESSAGE update'da yuboriladi.
+    app.add_handler(CommandHandler("bossiyons", business_autoreply.bossiyons_cmd, filters=filters.ChatType.PRIVATE), group=-4)
+    app.add_handler(CommandHandler("al_yordamchi", al_yordamchi.al_yordamchi_cmd, filters=filters.ChatType.PRIVATE), group=-4)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, _al_private_text_router), group=-4)
+    app.add_handler(CallbackQueryHandler(business_autoreply.choice_callback, pattern=r"^bar:"), group=-4)
+    app.add_handler(CallbackQueryHandler(al_yordamchi.callback, pattern=r"^al:"), group=-4)
+    app.add_handler(CommandHandler("cancel", al_yordamchi.cancel_cmd, filters=filters.ChatType.PRIVATE), group=-4)
+    app.add_handler(CommandHandler("cancel", business_autoreply.cancel_cmd, filters=filters.ChatType.PRIVATE), group=-4)
+    business_logger.info("BUSINESS_AUTOREPLY_HANDLERS_REGISTERED group=-4 commands=bossiyons,al_yordamchi,cancel text=private callbacks=bar:*,al:*")
+    logger.info("AL_ROUTER_REGISTERED group=-4 priority=before_conversations_and_universal_chat private_text_handler=_al_private_text_router stop_mode=ApplicationHandlerStop")
+    # ❌ Conversation tashqarisida ishlayotgan jarayonlar uchun ham (conversation fallback'lari bundan OLDIN tekshiriladi).
+    app.add_handler(CallbackQueryHandler(menu.cancel_cb, pattern=r"^cancel:all$"))
     app.add_handler(CommandHandler("yoqish", menu.group_enable_cmd))
     app.add_handler(CommandHandler("ochirish", menu.group_disable_cmd))
     # 🎁 /tabrik — private va group ikkalasida ham (filtersiz CommandHandler
@@ -1359,10 +1815,12 @@ def main():
     # Business → Chatbots orqali ulaganda/uzganda/sozlamasini
     # o'zgartirganda keladigan update. /tabrik'ning Business oqimi
     # (tabrik_business.py) shu saqlangan ma'lumotdan foydalanadi.
-    app.add_handler(BusinessConnectionHandler(_on_business_connection))
-    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, _on_business_message))
+    app.add_handler(BusinessConnectionHandler(_on_business_connection), group=-5)
+    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, _on_business_message), group=-5)
+    business_logger.info("BUSINESS_UPDATE_HANDLERS_REGISTERED group=-5 updates=business_connection,business_message")
     # 🎨 /rasim — Telegram Mini App orqali rasm chizish.
     app.add_handler(CommandHandler("rasim", rasim.rasim_cmd))
+    app.add_handler(CommandHandler("muzey", _museum_command))
     # 🎬 /vid — video yuklab olish (ASCII buyruq, Privacy Mode'dan qat'i
     # nazar barcha chat turlarida ishlaydi).
     app.add_handler(CommandHandler("vid", vid.vid_cmd))
@@ -1387,6 +1845,8 @@ def main():
     # /developer > 💎 Pro obunalar bo'limi IKKALASI HAM shu bitta
     # handlerni chaqiradi (callback_data bir xil).
     app.add_handler(CallbackQueryHandler(my_cabinet.prosub_decision_callback, pattern="^prosub:"))
+    # 💳 Admin: balans to'ldirish xabaridagi ✅ Tasdiqlash / ❌ Rad etish tugmalari.
+    app.add_handler(CallbackQueryHandler(payment_notify.admin_payment_decision_callback, pattern="^payn:"))
     # 🖼 Kabinetga rasm yuklash — ALOHIDA guruhda (group=1), shunda
     # boshqa (masalan "Suratlarni PDF qilish") conversation'lardagi rasm
     # handlerlariga (asosiy guruh — group=0) XALAQIT bermaydi; ikkalasi
@@ -1403,6 +1863,8 @@ def main():
     app.add_handler(build_essay_conv())
     app.add_handler(build_translate_conv())
     app.add_handler(build_pptx_conv())
+    # Suhbat tugagach qolib ketgan eski taqdimot tugmalari (Telegram "yuklanmoqda"da qotib qolmasin).
+    app.add_handler(CallbackQueryHandler(pptx_gen.stale_cb, pattern=r"^(px|pptx):"))
     app.add_handler(build_quiz_conv())
     app.add_handler(build_solve_conv())
     app.add_handler(build_summarize_conv())
@@ -1415,6 +1877,14 @@ def main():
     app.add_handler(build_wallet_topup_conv())
     app.add_handler(build_developer_conv())
     app.add_handler(build_kino_conv())
+    # Admin kino buyruqlari (conversation emas). Avval /kino_migration yozilgan edi,
+    # lekin hech qachon ro'yxatga olinmagan — bot unga javob bermasdi.
+    app.add_handler(CommandHandler("kino_migration", kino.kino_migration))
+    app.add_handler(CommandHandler("kino_check", kino.kino_check))
+    app.add_handler(CommandHandler("kino_quality", kino.kino_quality))
+    # 🧮 /hisobchi — faqat admin (handler ichida ham tekshiriladi)
+    app.add_handler(CommandHandler("hisobchi", hisobchi_cmd.hisobchi_cmd))
+    app.add_handler(CallbackQueryHandler(hisobchi_cmd.hisobchi_callback, pattern=r"^hsb:"))
 
     app.add_handler(CallbackQueryHandler(menu.universal_selected, pattern="^menu:universal$"))
     app.add_handler(CallbackQueryHandler(menu.back_to_menu, pattern="^menu:back$"))
@@ -1422,6 +1892,7 @@ def main():
     # 💰 Balansim / 🧾 To'lovlar tarixi — conversation emas, oddiy callback
     app.add_handler(CallbackQueryHandler(wallet_ui.entry_balance, pattern="^menu:wallet_balance$"))
     app.add_handler(CallbackQueryHandler(wallet_ui.entry_history, pattern="^menu:wallet_history$"))
+    app.add_handler(CallbackQueryHandler(wallet_ui.entry_invite, pattern="^menu:wallet_invite$"))
 
     # 🗂 Mening fayllarim — conversation emas, oddiy callback (ro'yxat + qayta yuborish)
     app.add_handler(CallbackQueryHandler(my_files.entry, pattern="^menu:myfiles$"))
@@ -1437,6 +1908,9 @@ def main():
 
     # 🎙 Ovozli xabar — istalgan paytda (hech qanday menyu tanlanmagan bo'lsa ham)
     app.add_handler(MessageHandler(filters.VOICE, voice.handle_voice))
+
+    # 🎨 Universal chatdagi rasm chizdirish tasdig'i (✅ Ha / ❌ Yo'q)
+    app.add_handler(CallbackQueryHandler(ai_image.confirm_callback, pattern="^aiimg:"))
 
     # UNIVERSAL CHAT — hech qanday conversation faol bo'lmaganda ishlaydi
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_chat.handle_message))
@@ -1463,16 +1937,32 @@ def main():
     # Conflict'ning o'zini hal qilmaydi. Agar boshqa instance doimiy ravishda
     # shu token bilan polling qilsa, retries tugagach xato ataylab ko'rinadi.
     try:
-        app.run_polling(
-            drop_pending_updates=True,
-            bootstrap_retries=config.POLLING_BOOTSTRAP_RETRIES,
-        )
+        # Render rolling deploy paytida eski process hali polling qilayotganida
+        # yangisi ham start olishi mumkin. GitHub lease-lock yangi processni
+        # eskisi to'liq to'xtab lockni bo'shatguncha kutdiradi. Lease heartbeat
+        # bilan yangilanadi; SIGTERM/graceful stop'da finally lock bo'shatiladi.
+        with config.github_distributed_lock(
+            "telegram_polling", lease_seconds=180, wait_timeout=600, heartbeat=True
+        ) as polling_lock_acquired:
+            if not polling_lock_acquired:
+                raise RuntimeError(
+                    "Telegram polling uchun yagona instance lock olinmadi. "
+                    "Eski instance to'xtaganini va GitHub ulanishini tekshiring."
+                )
+            logger.info("BOT_POLLING_LOCK_ACQUIRED; allowed_updates=ALL_TYPES")
+            app.run_polling(
+                drop_pending_updates=True,
+                bootstrap_retries=config.POLLING_BOOTSTRAP_RETRIES,
+                # Telegram Business ulanishi va shaxsiy Business xabarlari
+                # polling orqali ham aniq so'ralishi kerak.
+                allowed_updates=Update.ALL_TYPES,
+            )
     except telegram.error.Conflict as e:
         logger.critical(
-            "🚫 Telegram Conflict: boshqa bir jarayon HAM shu TELEGRAM_TOKEN bilan "
-            "getUpdates so'rovini yubormoqda — ikkita bot instansiyasi bir vaqtda "
-            "ishlab turibdi. Render dashboard'da duplicate servis/deploy yoki "
-            f"boshqa joyda ishlab turgan instansiyani tekshiring. Tafsilot: {e}"
+            "🚫 Telegram Conflict: distributed polling lock mavjud bo'lsa ham "
+            "getUpdates Conflict qaytdi. Bu shu token bilan ishlayotgan boshqa "
+            "tashqi server/process yoki webhook/polling aralashuvi bo'lishi mumkin. "
+            f"Tafsilot: {e}"
         )
         raise
 

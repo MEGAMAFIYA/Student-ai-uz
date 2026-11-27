@@ -9,8 +9,8 @@
   if (!room && startParam.startsWith("game_")) room = startParam.slice(5);
   const initData = tg?.initData || "";
 
-  let state = null, selected = null, mySide = null, myStyle = "classic";
-  let lastVersion = -1, lastChat = "", busy = false;
+  let state = null, selected = null, mySide = null, myStyle = "classic", myMark = null;
+  let lastVersion = -1, lastChat = "", busy = false, winShown = false;
   let peer = null, peerTarget = 0, makingOffer = false, pendingIce = [], ignoreOffer = false;
   let localStream = new MediaStream();
   let mediaBusy = false;
@@ -41,7 +41,7 @@
     if (!room) return status("Xona topilmadi");
     try {
       state = await api("/api/game/join", null, {room});
-      $("gameTitle").textContent = state.game === "chess" ? "♟ Shaxmat" : "⚪ Rus shashkasi";
+      $("gameTitle").textContent = state.game === "chess" ? "♟ Shaxmat" : state.game === "checkers" ? "⚪ Rus shashkasi" : state.game === "memory" ? "🧠 Xotira o‘yini" : state.game === "quoridor" ? "🧱 Quoridor" : "❌⭕ X-O o‘yini";
       renderLobby(); render();
       await pollChat();
       setInterval(poll, 650);
@@ -51,8 +51,63 @@
     } catch (e) { status("❌ " + e.message); }
   }
 
+  const memSizeLabels = {"4x4":"4×4 (8 juft)","4x6":"4×6 (12 juft)","6x6":"6×6 (18 juft)"};
+  let myMemSize = null, myMemSymbols = null, memButtonsBuilt = false;
+
+  function buildMemoryButtons() {
+    if (memButtonsBuilt || !state) return;
+    const sizes = state.memory_sizes || Object.keys(memSizeLabels);
+    $("memSizeRow").innerHTML = sizes.map(s => `<button class="choice memsize" data-size="${s}">📐 <b>${escapeHtml(memSizeLabels[s] || s)}</b></button>`).join("");
+    const symbolSets = state.memory_symbol_sets || {};
+    $("memSymbolsRow").innerHTML = Object.entries(symbolSets).map(([key, label]) => `<button class="choice memsym" data-symbols="${key}">${escapeHtml(label)}</button>`).join("");
+    document.querySelectorAll(".memsize").forEach(b => b.onclick = () => { myMemSize = b.dataset.size; renderLobby(); });
+    document.querySelectorAll(".memsym").forEach(b => b.onclick = () => { myMemSymbols = b.dataset.symbols; renderLobby(); });
+    memButtonsBuilt = true;
+  }
+
   function renderLobby() {
-    const ps = state?.players || [];
+    if (!state) return;
+    const ps = state.players || [];
+    $("lobbyQuoridor").classList.toggle("hidden", state.game !== "quoridor");
+    if (state.game === "quoridor") {
+      $("lobbyChess").classList.add("hidden"); $("lobbyMemory").classList.add("hidden"); $("lobbyTTT").classList.add("hidden");
+      $("lobbyText").textContent = "Raqib qo‘shilishini kutyapmiz. Havolani do‘stingizga yuboring.";
+      $("players").innerHTML = ps.map(p => `<span>● ${escapeHtml(p.name || "O‘yinchi")}</span>`).join("");
+      return;
+    }
+    if (state.game === "memory") {
+      $("lobbyChess").classList.add("hidden");
+      $("lobbyTTT").classList.add("hidden");
+      $("lobbyMemory").classList.remove("hidden");
+      buildMemoryButtons();
+      if (myMemSize == null) myMemSize = state.memory_size;
+      if (myMemSymbols == null) myMemSymbols = state.memory_symbols;
+      $("lobbyText").textContent = ps.length < 2 ? "Do‘stingiz ham shu xona orqali kirishini kuting." : "Ikkalangiz katak o‘lchami va belgilarni tanlab, tayyor bo‘ling.";
+      $("players").innerHTML = ps.map(p => `<span>● ${escapeHtml(p.name || (p.id === state.me ? "Siz" : "Do‘st"))} ${state.memory_ready?.[String(p.id)] ? "✅ Tayyor" : "⏳"}</span>`).join("");
+      document.querySelectorAll(".memsize").forEach(b => b.classList.toggle("selected", b.dataset.size === myMemSize));
+      document.querySelectorAll(".memsym").forEach(b => b.classList.toggle("selected", b.dataset.symbols === myMemSymbols));
+      const iAmReady = !!state.memory_ready?.[String(state.me)];
+      $("memReadyBtn").disabled = iAmReady;
+      $("memReadyBtn").textContent = iAmReady ? "⏳ Do‘stingiz kutilmoqda…" : "✓ Tayyor";
+      const readyCount = Object.keys(state.memory_ready || {}).length;
+      $("memReadyStatus").textContent = ps.length < 2 ? "" : `Tayyor: ${readyCount}/2`;
+      return;
+    }
+    if (state.game === "tictactoe") {
+      $("lobbyChess").classList.add("hidden");
+      $("lobbyMemory").classList.add("hidden");
+      $("lobbyTTT").classList.remove("hidden");
+      const me = ps.find(p => p.id === state.me);
+      if (myMark == null) myMark = me?.mark || null;
+      $("lobbyText").textContent = ps.length < 2 ? "Do‘stingiz ham shu xona orqali kirishini kuting." : "Ikkalangiz belgi (X yoki O) tanlang.";
+      $("players").innerHTML = ps.map(p => `<span>● ${escapeHtml(p.name || (p.id === state.me ? "Siz" : "Do‘st"))} ${p.mark ? (p.mark === "x" ? "❌ X" : "⭕ O") : "— tanlamagan"}</span>`).join("");
+      document.querySelectorAll(".mark").forEach(b => b.classList.toggle("selected", b.dataset.mark === myMark));
+      $("markReadyBtn").disabled = !myMark;
+      return;
+    }
+    $("lobbyMemory").classList.add("hidden");
+    $("lobbyTTT").classList.add("hidden");
+    $("lobbyChess").classList.remove("hidden");
     $("lobbyText").textContent = ps.length < 2 ? "Do‘stingiz ham shu xona orqali kirishini kuting." : "Ikkalangiz rang va ko‘rinishni tanlang.";
     $("players").innerHTML = ps.map(p => `<span>● ${escapeHtml(p.name || (p.id === state.me ? "Siz" : "Do‘st"))} ${p.side === "w" ? "⚪ Oq" : p.side === "b" ? "⚫ Qora" : "— tanlamagan"}</span>`).join("");
     document.querySelectorAll(".side").forEach(b => b.classList.toggle("selected", b.dataset.side === mySide));
@@ -61,43 +116,169 @@
   }
   document.querySelectorAll(".side").forEach(b => b.onclick = () => { mySide = b.dataset.side; renderLobby(); });
   document.querySelectorAll(".style").forEach(b => b.onclick = () => { myStyle = b.dataset.style; renderLobby(); });
+  document.querySelectorAll(".mark").forEach(b => b.onclick = () => { myMark = b.dataset.mark; renderLobby(); });
   $("readyBtn").onclick = async () => {
     try { state = await api("/api/game/choose", null, {room, side:mySide, style:myStyle}); renderLobby(); render(); }
     catch (e) { tg?.showAlert?.(e.message); }
+  };
+  $("markReadyBtn").onclick = async () => {
+    try { state = await api("/api/game/tictactoe/mark", {room, mark: myMark}); renderLobby(); render(); }
+    catch (e) { tg?.showAlert?.(e.message); }
+  };
+  $("memReadyBtn").onclick = async () => {
+    try {
+      state = await api("/api/game/memory/config", {room, size: myMemSize, symbols: myMemSymbols});
+      state = await api("/api/game/memory/ready", {room});
+      renderLobby(); render();
+    } catch (e) { tg?.showAlert?.(e.message); }
   };
 
   function playerById(id) { return state?.players?.find(p => Number(p.id) === Number(id)); }
   function render() {
     if (!state) return;
-    if (state.status === "lobby") { $("lobby").classList.remove("hidden"); $("game").classList.add("hidden"); return; }
+    if (state.status === "lobby") { renderLobby(); $("lobby").classList.remove("hidden"); $("game").classList.add("hidden"); return; }
     $("lobby").classList.add("hidden"); $("game").classList.remove("hidden");
     const me = playerById(state.me), op = state.players.find(p => Number(p.id) !== Number(state.me));
-    mySide = me?.side || mySide; myStyle = me?.style || myStyle;
-    fillPlayer($("playerMe"), me, true); fillPlayer($("playerOpp"), op, false);
-    status(state.status === "finished" ? "🏁 Tugadi" : state.turn === mySide ? "🟢 Sizning yurishingiz" : "🕐 Do‘stingiz yurmoqda");
-    drawBoard();
+    const isQ = state.game === "quoridor";
+    board.classList.toggle("hidden", isQ); $("qBoard").classList.toggle("hidden", !isQ); $("qPanel").classList.toggle("hidden", !isQ);
+    if (!isQ) $("rematchBtn").classList.add("hidden");
+    if (isQ) {
+      fillPlayer($("playerMe"), me, true); fillPlayer($("playerOpp"), op, false);
+      $("memScoreboard").classList.add("hidden");
+      const myTurn = state.status === "playing" && state.q.my_pid === state.turn;
+      status(state.status === "finished" ? "🏁 Tugadi" : myTurn ? "🟢 Sizning yurishingiz" : "🕐 Raqib yurmoqda");
+      renderQuoridor();
+    } else if (state.game === "memory") {
+      fillPlayer($("playerMe"), me, true); fillPlayer($("playerOpp"), op, false);
+      const myTurn = String(state.turn) === String(state.me);
+      status(state.status === "finished" ? "🏁 Tugadi" : myTurn ? "🟢 Sizning navbatingiz" : "🕐 Do‘stingiz navbati");
+      drawMemoryBoard();
+      renderMemScoreboard();
+    } else if (state.game === "tictactoe") {
+      myMark = me?.mark || myMark;
+      fillPlayer($("playerMe"), me, true); fillPlayer($("playerOpp"), op, false);
+      const myTurn = state.turn === myMark;
+      status(state.status === "finished" ? "🏁 Tugadi" : myTurn ? "🟢 Sizning navbatingiz" : "🕐 Do‘stingiz navbati");
+      drawTTTBoard();
+      $("memScoreboard").classList.add("hidden");
+    } else {
+      mySide = me?.side || mySide; myStyle = me?.style || myStyle;
+      fillPlayer($("playerMe"), me, true); fillPlayer($("playerOpp"), op, false);
+      status(state.status === "finished" ? "🏁 Tugadi" : state.turn === mySide ? "🟢 Sizning yurishingiz" : "🕐 Do‘stingiz yurmoqda");
+      drawBoard();
+      $("memScoreboard").classList.add("hidden");
+    }
     if (state.status === "finished") {
-      const text = state.winner ? `🏆 ${state.winner === mySide ? "Siz yutdingiz!" : "Do‘stingiz yutdi!"}` : "🤝 Durang";
-      $("result").textContent = text + "  " + (state.reason || "");
+      const iWon = (state.game === "memory" || state.game === "tictactoe" || isQ)
+        ? String(state.winner) === String(state.me)
+        : state.winner === mySide;
+      const text = state.winner ? `🏆 ${iWon ? "Siz yutdingiz!" : "Do‘stingiz yutdi!"}` : "🤝 Durang";
+      let extra = state.reason || "";
+      if (isQ) {
+        const wp = state.q.winner_pid === "1" ? state.q.p1 : state.q.p2;
+        extra = (state.reason === "surrender" ? "🏳️ Taslim bo‘ldi. " : "🎯 Maqsad qatoriga yetdi. ") + (wp ? "G‘olib: " + (wp.username ? "@" + wp.username : wp.name) : "");
+      }
+      $("result").textContent = text + "  " + extra;
       $("result").classList.remove("hidden");
-      if (state.winner) winFx();
-    } else $("result").classList.add("hidden");
+      if (isQ) { $("rematchBtn").classList.remove("hidden"); }
+      if (state.winner && !winShown) { winShown = true; winFx(); }
+    } else { $("result").classList.add("hidden"); winShown = false; if (isQ) { $("rematchBtn").classList.add("hidden"); $("rematchBtn").textContent = "🔄 Qayta o‘ynash"; } }
   }
   function fillPlayer(card, p, mine) {
     const name = p?.name || (mine ? "Siz" : "Do‘stingiz");
     card.querySelector(".player-name").textContent = name;
-    card.querySelector(".side-label").textContent = p?.side === "w" ? "⚪ Oq" : p?.side === "b" ? "⚫ Qora" : "";
+    const label = card.querySelector(".side-label");
+    if (state.game === "quoridor") {
+      const pid = p && state.q.p1 && Number(state.q.p1.id) === Number(p.id) ? "1" : "2";
+      label.textContent = `${pid === "1" ? "🔵" : "🔴"} 🧱 ${state.q.walls_left?.[pid] ?? 0}`;
+    } else if (state.game === "memory") {
+      const sc = (state.scores && p) ? (state.scores[String(p.id)] || 0) : 0;
+      label.textContent = `🎯 ${sc} juft`;
+    } else if (state.game === "tictactoe") {
+      label.textContent = p?.mark === "x" ? "❌ X" : p?.mark === "o" ? "⭕ O" : "";
+    } else {
+      label.textContent = p?.side === "w" ? "⚪ Oq" : p?.side === "b" ? "⚫ Qora" : "";
+    }
     card.querySelector(".avatar").textContent = mine ? "🙂" : "👤";
+  }
+
+  function drawTTTBoard() {
+    board.className = "board ttt";
+    board.style.gridTemplateColumns = "repeat(3, 1fr)";
+    board.innerHTML = "";
+    const canPlay = state.status === "playing" && state.turn === myMark;
+    (state.board || []).forEach((v, idx) => {
+      const btn = document.createElement("button");
+      btn.className = "card ttt-cell " + (v ? "card-revealed" : "card-hidden");
+      if (state.win_line && state.win_line.includes(idx)) btn.classList.add("card-matched");
+      const face = document.createElement("span");
+      face.className = "card-face";
+      face.textContent = v === "x" ? "❌" : v === "o" ? "⭕" : "";
+      btn.appendChild(face);
+      if (!v && canPlay) btn.onclick = () => tttMove(idx); else btn.disabled = true;
+      board.appendChild(btn);
+    });
+  }
+  async function tttMove(idx) {
+    if (busy) return; busy = true;
+    try { state = await api("/api/game/tictactoe/move", {room, index: idx}); render(); tone(420, .07); }
+    catch (e) { tg?.showAlert?.(e.message); }
+    finally { busy = false; }
+  }
+
+  function renderMemScoreboard() {
+    const box = $("memScoreboard");
+    box.classList.remove("hidden");
+    const me = playerById(state.me), op = state.players.find(p => Number(p.id) !== Number(state.me));
+    const myScore = (state.scores && me) ? (state.scores[String(me.id)] || 0) : 0;
+    const opScore = (state.scores && op) ? (state.scores[String(op.id)] || 0) : 0;
+    box.innerHTML = `<span>🙂 Siz: <b>${myScore}</b></span><span>👤 ${escapeHtml(op?.name || "Do‘st")}: <b>${opScore}</b></span>`;
+  }
+
+  let lastRevealTs = 0, memBusy = false;
+  function drawMemoryBoard() {
+    const rows = state.rows || 4, cols = state.cols || 4;
+    board.className = "board memory";
+    board.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    const fresh = state.last_reveal && state.last_reveal.ts !== lastRevealTs ? state.last_reveal : null;
+    board.innerHTML = "";
+    (state.board || []).forEach((cell, idx) => {
+      const btn = document.createElement("button");
+      const canFlip = cell.state === "hidden" && state.status === "playing" && String(state.turn) === String(state.me);
+      btn.className = "card " + (cell.state === "hidden" ? "card-hidden" : cell.state === "matched" ? "card-matched" : "card-revealed");
+      if (fresh && fresh.indices.includes(idx)) btn.classList.add(fresh.matched ? "pop-match" : "pop-miss");
+      const face = document.createElement("span");
+      face.className = "card-face";
+      face.textContent = cell.state === "hidden" ? "❔" : cell.symbol;
+      btn.appendChild(face);
+      if (canFlip) btn.onclick = () => flipCard(idx); else btn.disabled = true;
+      board.appendChild(btn);
+    });
+    if (state.last_reveal) lastRevealTs = state.last_reveal.ts;
+  }
+  async function flipCard(idx) {
+    if (memBusy) return; memBusy = true;
+    try {
+      state = await api("/api/game/memory/flip", {room, index: idx});
+      render();
+      if (state.last_reveal) tone(state.last_reveal.matched ? 560 : 160, .08);
+    } catch (e) { tg?.showAlert?.(e.message); }
+    finally { memBusy = false; }
   }
 
   function orient(r,c) { return mySide === "b" ? [7-r,7-c] : [r,c]; }
   function drawBoard() {
+    board.className = "board"; board.style.gridTemplateColumns = "";
     board.innerHTML = ""; const b = state.board;
     for (let vr=0;vr<8;vr++) for (let vc=0;vc<8;vc++) {
       const [r,c] = orient(vr,vc), sq = document.createElement("button");
       sq.className = "sq " + (((r+c)%2) ? "dark" : "light"); sq.dataset.r=r; sq.dataset.c=c;
+      if (state.game === "checkers" && (r+c)%2===0) { sq.classList.add("empty-square"); sq.disabled=true; }
       if (selected && selected[0]===r && selected[1]===c) sq.classList.add("selected");
-      if (selected && isLegalTarget(r,c)) sq.classList.add(b[r][c] ? "capture" : "legal");
+      if (selected && isLegalTarget(r,c)) {
+        const isEpCapture = state.game === "chess" && state.ep && state.ep[0]===r && state.ep[1]===c;
+        sq.classList.add((b[r][c] || isEpCapture) ? "capture" : "legal");
+      }
       const p = b[r][c];
       if (p) {
         const d=document.createElement("span");
@@ -105,38 +286,169 @@
         else { d.className=`checker ${p.toLowerCase()==="b"?"b ":""}${p===p.toUpperCase()?"king ":""}`; }
         sq.appendChild(d);
       }
-      sq.onclick=()=>clickSquare(r,c); board.appendChild(sq);
+      if (!(state.game === "checkers" && (r+c)%2===0)) sq.onclick=()=>clickSquare(r,c); board.appendChild(sq);
     }
   }
-  function isLegalTarget(r,c) { if(!selected)return false; return state.game==="chess" ? chessTargets(selected[0],selected[1]).some(x=>x[0]===r&&x[1]===c) : checkerTargets(selected[0],selected[1]).some(x=>x[0]===r&&x[1]===c); }
-  function chessTargets(r,c) {
-    const p=state.board[r][c]; if(!p || p.toLowerCase()!==mySide)return [];
-    const own=p===p.toUpperCase(), out=[]; const add=(rr,cc)=>{if(rr<0||rr>7||cc<0||cc>7)return false;if(!state.board[rr][cc]){out.push([rr,cc]);return true}if((state.board[rr][cc]===state.board[rr][cc].toUpperCase())!==own)out.push([rr,cc]);return false};
-    if(p.toLowerCase()==="p"){const d=own?-1:1;if(!state.board[r+d]?.[c]){out.push([r+d,c]);const st=own?6:1;if(r===st&&!state.board[r+2*d][c])out.push([r+2*d,c])}for(const dc of[-1,1]){const rr=r+d,cc=c+dc;if(rr>=0&&rr<8&&cc>=0&&cc<8&&state.board[rr][cc]&&(state.board[rr][cc]===state.board[rr][cc].toUpperCase())!==own)out.push([rr,cc])}}
-    if(p.toLowerCase()==="n")for(const[dr,dc]of[[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]])add(r+dr,c+dc);
-    if("brq".includes(p.toLowerCase())){let ds=[];if("bq".includes(p.toLowerCase()))ds.push(...[[-1,-1],[-1,1],[1,-1],[1,1]]);if("rq".includes(p.toLowerCase()))ds.push(...[[-1,0],[1,0],[0,-1],[0,1]]);for(const[dr,dc]of ds){let rr=r+dr,cc=c+dc;while(add(rr,cc)){rr+=dr;cc+=dc}}}
-    if(p.toLowerCase()==="k")for(const[dr,dc]of[[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]])add(r+dr,c+dc);
-    return out;
+  function targetsFor(r, c) {
+    if (!state?.legal_moves) return [];
+    return state.legal_moves.filter(m => m[0] === r && m[1] === c).map(m => [m[2], m[3]]);
   }
-  function checkerTargets(r,c) {
-    const p=state.board[r][c];if(!p||p.toLowerCase()!==mySide)return[];const dirs=[[-1,-1],[-1,1],[1,-1],[1,1]],caps=[];
-    if(p===p.toUpperCase()){for(const[dr,dc]of dirs){let rr=r+dr,cc=c+dc,seen=false,cap=null;while(rr>=0&&rr<8&&cc>=0&&cc<8){const q=state.board[rr][cc];if(!q){if(seen)caps.push([rr,cc])}else{if(q.toLowerCase()===mySide||seen)break;seen=true;cap=[rr,cc]}rr+=dr;cc+=dc}}}
-    else for(const[dr,dc]of dirs){const mr=r+dr,mc=c+dc,lr=r+2*dr,lc=c+2*dc;if(lr>=0&&lr<8&&lc>=0&&lc<8&&state.board[mr]?.[mc]&&state.board[mr][mc].toLowerCase()!==mySide&&state.board[lr][lc]===null)caps.push([lr,lc]);}
-    if(caps.length)return caps;
-    if(p===p.toUpperCase()){const out=[];for(const[dr,dc]of dirs){let rr=r+dr,cc=c+dc;while(rr>=0&&rr<8&&cc>=0&&cc<8&&!state.board[rr][cc]){out.push([rr,cc]);rr+=dr;cc+=dc}}return out}
-    const d=mySide==="w"?-1:1;return[-1,1].map(dc=>[r+d,c+dc]).filter(x=>x[0]>=0&&x[0]<8&&x[1]>=0&&x[1]<8&&!state.board[x[0]][x[1]]);
-  }
+  function isLegalTarget(r,c) { if(!selected)return false; return targetsFor(selected[0],selected[1]).some(x=>x[0]===r&&x[1]===c); }
   function clickSquare(r,c){
     if(state.status!=="playing"||state.turn!==mySide)return;
     const p=state.board[r][c];
-    if(selected&&isLegalTarget(r,c)){sendMove(selected,[r,c]);selected=null;drawBoard();return;}
+    if(selected&&isLegalTarget(r,c)){
+      const moved=state.board[selected[0]][selected[1]];
+      const isPromotion = state.game==="chess" && moved && moved.toLowerCase()==="p" && (r===0||r===7);
+      const fr=selected; selected=null; drawBoard();
+      if (isPromotion) { askPromotion(fr,[r,c]); } else { sendMove(fr,[r,c]); }
+      return;
+    }
     if(p&&p.toLowerCase()===mySide){selected=[r,c];drawBoard();}else{selected=null;drawBoard();}
   }
-  async function sendMove(fr,to){
+  function askPromotion(fr, to) {
+    $("promoPicker").classList.remove("hidden");
+    const handler = (ev) => {
+      const btn = ev.target.closest(".promo-choice");
+      if (!btn) return;
+      $("promoPicker").classList.add("hidden");
+      $("promoPicker").removeEventListener("click", handler);
+      sendMove(fr, to, btn.dataset.p);
+    };
+    $("promoPicker").addEventListener("click", handler);
+  }
+  async function sendMove(fr,to,promotion="q"){
     if(busy)return;busy=true;
-    try{const old=state;state=await api("/api/game/move",{room,from:fr,to,promotion:"q"});render();fx(state.last_move?.captured?"capture":"move",to);tone(state.last_move?.captured?180:420,.07);}
+    try{const old=state;state=await api("/api/game/move",{room,from:fr,to,promotion});render();fx(state.last_move?.captured?"capture":"move",to);tone(state.last_move?.captured?180:420,.07);}
     catch(e){tg?.showAlert?.(e.message);}finally{busy=false;}
   }
+
+  // ---------- 🧱 Quoridor (Mini App) ----------
+  // Server (game.py + quoridor.py) barcha qoidalarni tekshiradi; bu yerda faqat interfeys.
+  const QG = 0.26, QT = 9 + 8 * QG;            // devor yo'lagi / doska o'lchami (katak = 1 birlik)
+  let qMode = "move", qDraft = null, qBuilt = false, qPawns = {}, qLayers = {};
+  const qFlip = () => state?.q?.my_pid === "2";   // 2-o'yinchi doskani aylantirib ko'radi: o'zi doim pastda
+  const qPct = v => (v / QT * 100) + "%";
+  function qRect(x, y, w, h) {                     // birlik koordinatalar -> % (aylantirish bilan)
+    if (qFlip()) { x = QT - x - w; y = QT - y - h; }
+    return `left:${qPct(x)};top:${qPct(y)};width:${qPct(w)};height:${qPct(h)}`;
+  }
+  const qCellXY = (r, c) => [c * (1 + QG), r * (1 + QG)];
+  function qWallRect(o, r, c) {
+    return o === "h" ? qRect(c * (1 + QG), r * (1 + QG) + 1, 2 + QG, QG) : qRect(c * (1 + QG) + 1, r * (1 + QG), QG, 2 + QG);
+  }
+  function qBuild() {
+    if (qBuilt) return;
+    const b = $("qBoard"); b.innerHTML = "";
+    for (const n of ["cells", "walls", "pawns"]) { const d = document.createElement("div"); d.style.cssText = "position:absolute;inset:0;pointer-events:none"; b.appendChild(d); qLayers[n] = d; }
+    for (const pid of ["1", "2"]) { const e = document.createElement("div"); e.className = "qpawn p" + pid; qLayers.pawns.appendChild(e); qPawns[pid] = e; }
+    const ov = document.createElement("div"); ov.className = "qover hidden"; b.appendChild(ov); qLayers.over = ov;
+    ov.addEventListener("click", ev => {
+      const rc = b.getBoundingClientRect();
+      let x = (ev.clientX - rc.left) / rc.width * QT, y = (ev.clientY - rc.top) / rc.height * QT;
+      if (qFlip()) { x = QT - x; y = QT - y; }
+      const k = v => Math.max(0, Math.min(7, Math.round((v - (1 + QG / 2)) / (1 + QG))));
+      const c = k(x), r = k(y);
+      if (qDraft && qDraft.r === r && qDraft.c === c) qDraft.o = qDraft.o === "h" ? "v" : "h";
+      else qDraft = {o: qDraft?.o || "h", r, c};
+      renderQuoridor();
+    });
+    qBuilt = true;
+  }
+  function qWallProblem(d) {
+    const q = state.q;
+    if (q.legal_walls.includes(`${d.o}:${d.r}:${d.c}`)) return null;
+    for (const w of q.walls) {
+      if (w.r === d.r && w.c === d.c && w.o !== d.o) return "Devorlar kesishmasligi kerak.";
+      if (w.o === d.o && ((d.o === "h" && w.r === d.r && Math.abs(w.c - d.c) <= 1) || (d.o === "v" && w.c === d.c && Math.abs(w.r - d.r) <= 1))) return "Bu joyda devor bor (ustma-ust tushadi).";
+    }
+    return "Bu devor yo‘lni butunlay to‘sib qo‘yadi — mumkin emas.";
+  }
+  function renderQuoridor() {
+    qBuild();
+    const q = state.q, myPid = q.my_pid, playing = state.status === "playing";
+    const myTurn = playing && myPid === state.turn;
+    const myWalls = q.walls_left[myPid] || 0;
+    if (!myTurn || myWalls <= 0) { if (qMode === "wall") qMode = "move"; }
+    if (qMode !== "wall") qDraft = null;
+    // katakllar
+    const goalMe = myPid === "1" ? 0 : 8, goalOpp = myPid === "1" ? 8 : 0;
+    const legal = new Set(qMode === "move" && myTurn ? q.legal_moves.map(m => m[0] + "," + m[1]) : []);
+    qLayers.cells.innerHTML = "";
+    for (let r = 0; r < 9; r++) for (let c = 0; c < 9; c++) {
+      const [x, y] = qCellXY(r, c), el = document.createElement("button");
+      el.className = "qcell" + (r === goalMe ? " goal-me" : r === goalOpp ? " goal-opp" : "") + (legal.has(r + "," + c) ? " legal" : "");
+      el.style.cssText = qRect(x, y, 1, 1);
+      if (legal.has(r + "," + c)) el.onclick = () => qSendMove(r, c); else el.tabIndex = -1;
+      qLayers.cells.appendChild(el);
+    }
+    // devorlar
+    qLayers.walls.innerHTML = "";
+    q.walls.forEach((w, i) => {
+      const el = document.createElement("div"); el.className = "qwall" + (i === q.walls.length - 1 ? " last" : "");
+      el.style.cssText = qWallRect(w.o, w.r, w.c); qLayers.walls.appendChild(el);
+    });
+    let problem = null;
+    if (qDraft) {
+      problem = qWallProblem(qDraft);
+      const el = document.createElement("div"); el.className = "qwall " + (problem ? "draft-bad" : "draft-ok");
+      el.style.cssText = qWallRect(qDraft.o, qDraft.r, qDraft.c); qLayers.walls.appendChild(el);
+    }
+    // piyodalar
+    for (const pid of ["1", "2"]) {
+      const [r, c] = q.pawns[pid], [x, y] = qCellXY(r, c), e = qPawns[pid];
+      const pad = 0.14;
+      e.style.cssText = qRect(x + pad, y + pad, 1 - 2 * pad, 1 - 2 * pad);
+      e.className = "qpawn p" + pid + (pid === myPid ? " mine" : "") + (playing && state.turn === pid ? " turn" : "");
+    }
+    // boshqaruv
+    qLayers.over.classList.toggle("hidden", !(qMode === "wall" && myTurn));
+    $("qModeRow").classList.toggle("hidden", !playing);
+    $("qModeMove").classList.toggle("active", qMode === "move");
+    $("qModeWall").classList.toggle("active", qMode === "wall");
+    $("qModeWall").textContent = `🧱 Devor qo‘yish (${myWalls})`;
+    $("qModeWall").disabled = !myTurn || myWalls <= 0;
+    $("qModeMove").disabled = !myTurn;
+    $("qWallRow").classList.toggle("hidden", qMode !== "wall");
+    $("qWallConfirm").classList.toggle("hidden", qMode !== "wall");
+    $("qOrH").classList.toggle("active", (qDraft?.o || "h") === "h");
+    $("qOrV").classList.toggle("active", qDraft?.o === "v");
+    $("qWallOk").disabled = !qDraft || !!problem;
+    const info = $("qInfo");
+    if (state.status === "finished") info.textContent = q.last || "";
+    else if (qMode === "wall") info.textContent = !qDraft ? "Doskada devor markazi bo‘ladigan joyga bosing (katta kataklar burchagiga)." : problem ? "⛔ " + problem : "✅ Joylashtirish mumkin — tasdiqlang. Xuddi shu joyga yana bossangiz yo‘nalish almashadi.";
+    else info.textContent = (myTurn ? "Sariq belgili katakni bosib yuring. " : "Raqib navbati. ") + (q.last ? "↪️ " + q.last : "");
+  }
+  async function qSendMove(r, c) {
+    if (busy) return; busy = true;
+    try { state = await api("/api/game/quoridor/move", {room, r, c}); render(); tone(420, .07); try { tg?.HapticFeedback?.impactOccurred?.("light"); } catch (_) {} }
+    catch (e) { tg?.showAlert?.(e.message); }
+    finally { busy = false; }
+  }
+  async function qSendWall() {
+    if (busy || !qDraft) return; busy = true;
+    const d = qDraft;
+    try { state = await api("/api/game/quoridor/wall", {room, r: d.r, c: d.c, o: d.o}); qDraft = null; qMode = "move"; render(); tone(260, .09); try { tg?.HapticFeedback?.impactOccurred?.("medium"); } catch (_) {} }
+    catch (e) { tg?.showAlert?.(e.message); }
+    finally { busy = false; }
+  }
+  $("qModeMove").onclick = () => { qMode = "move"; renderQuoridor(); };
+  $("qModeWall").onclick = () => { qMode = "wall"; renderQuoridor(); };
+  $("qOrH").onclick = () => { if (qDraft) { qDraft.o = "h"; renderQuoridor(); } };
+  $("qOrV").onclick = () => { if (qDraft) { qDraft.o = "v"; renderQuoridor(); } };
+  $("qWallOk").onclick = qSendWall;
+  $("qWallCancel").onclick = () => { qMode = "move"; qDraft = null; renderQuoridor(); };
+  $("qRules").onclick = () => tg?.showAlert ? tg.showAlert("Maqsad: raqib boshlagan qatorga birinchi yetib borish.\nNavbatda: 1 katak yuring YOKI devor qo‘ying (10 tadan).\nRaqib yonida bo‘lsa — ustidan sakrang (orqasi to‘silgan bo‘lsa yon tomonga).\nRaqibning maqsad qatoriga boradigan barcha yo‘lni to‘sish mumkin emas.") : alert("Qoidalar: 1 katak yuring yoki devor qo‘ying; birinchi bo‘lib qarshi qatorga yetgan g‘olib.");
+  $("qShareBtn").onclick = () => {
+    const u = state?.share_url || ""; if (!u) return;
+    const link = "https://t.me/share/url?url=" + encodeURIComponent(u) + "&text=" + encodeURIComponent("🧱 Quoridor o‘ynaymizmi? Havolani bosing:");
+    if (tg?.openTelegramLink) tg.openTelegramLink(link); else window.open(link, "_blank");
+  };
+  $("rematchBtn").onclick = async () => {
+    try { state = await api("/api/game/rematch", {room}); qDraft = null; qMode = "move"; render(); if (state.status === "finished") { $("rematchBtn").textContent = "⏳ Raqib roziligi kutilmoqda…"; } }
+    catch (e) { tg?.showAlert?.(e.message); }
+  };
+
   async function poll(){
     try{const d=await api("/api/game/state",null,{room});if(lastVersion<0||d.version>lastVersion){lastVersion=d.version;state=d;render();ensurePeer();}}
     catch(e){console.warn("game state",e);}

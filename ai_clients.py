@@ -24,19 +24,43 @@ qo'llab-quvvatlanadi.
 
 import asyncio
 import logging
+import os
 import re
+import time
 from urllib.parse import quote
 
 import httpx
 import google.generativeai as genai
 
 import config
+import hisobchi  # 🧮 admin hisobchi: faqat xotiraga yozadi, hech qachon xato bermaydi
 
 logger = logging.getLogger(__name__)
 
-GEMINI_TIMEOUT_SEC = 90  # Gemini javob bermasa, cheksiz kutmaslik uchun
+GEMINI_TIMEOUT_SEC = max(30, int(os.getenv("GEMINI_TIMEOUT_SEC", "120")))  # Gemini javob bermasa, cheksiz kutmaslik uchun
 
 _gemini_model_cache: dict[tuple[str, str], object] = {}
+# Gemini kvotasi odatda loyiha + model bo'yicha umumiy. Birinchi 429 dan
+# keyin ayni model uchun boshqa kalitlarni ham ketma-ket urmaslik uchun
+# jarayon ichidagi circuit-breaker. Render qayta ishga tushsa cooldown yangidan
+# hisoblanadi; Google javobidagi retry_delay imkon qadar aniq olinadi.
+_gemini_quota_cooldowns: dict[str, float] = {}
+_GEMINI_QUOTA_DEFAULT_COOLDOWN_SEC = max(60, int(os.getenv("GEMINI_QUOTA_DEFAULT_COOLDOWN_SEC", "3600")))
+
+
+def _gemini_quota_remaining(model_name: str) -> int:
+    until = _gemini_quota_cooldowns.get(model_name, 0.0)
+    return max(0, int(until - time.monotonic()))
+
+
+def _set_gemini_quota_cooldown(model_name: str, error_text: str) -> int:
+    match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", error_text, re.IGNORECASE)
+    seconds = int(match.group(1)) if match else _GEMINI_QUOTA_DEFAULT_COOLDOWN_SEC
+    seconds = max(60, min(seconds, 7 * 24 * 60 * 60))
+    _gemini_quota_cooldowns[model_name] = max(
+        _gemini_quota_cooldowns.get(model_name, 0.0), time.monotonic() + seconds
+    )
+    return seconds
 # google-generativeai kutubxonasining genai.configure() chaqiruvi JARAYON
 # DARAJASIDA GLOBAL holatni o'zgartiradi (bitta API kalitni "joriy" qilib
 # qo'yadi). Loyihada bir nechta turli Gemini kalit bir vaqtda ishlatilishi
@@ -89,7 +113,16 @@ def _classify_gemini_error(e: Exception) -> tuple[str, str]:
         or "PermissionDenied" in type_name or "Unauthenticated" in type_name
         or "401" in msg or "403" in msg
     ):
-        return "invalid", "Kalit yaroqsiz, bekor qilingan yoki model nomi noto'g'ri."
+        return "invalid", "API kalit yaroqsiz, bekor qilingan yoki ruxsat berilmagan."
+    if (
+        "404" in msg
+        or "not found" in msg.lower()
+        or "model not found" in msg.lower()
+        or "is not found" in msg.lower()
+    ):
+        return "model_not_found", "Gemini modeli topilmadi — model nomi noto'g'ri, eskirgan yoki API loyihada mavjud emas."
+    if "400" in msg or "invalid argument" in msg.lower() or "invalid_argument" in msg.lower():
+        return "bad_request", "Gemini so'rovi noto'g'ri — model yoki yuborilgan media parametrlari mos emas."
     return "error", msg[:200]
 
 
@@ -113,6 +146,9 @@ async def _call_gemini(
     """Qaytaradi: (natija yoki None, status, tafsilot)."""
     if not api_key or not model:
         return None, "invalid", "Kalit yoki model sozlanmagan."
+    remaining = _gemini_quota_remaining(model)
+    if remaining:
+        return None, "quota", f"{model} uchun Gemini kvota kutish rejimida ({remaining} soniya qoldi)."
     logger.info(f"{label} ({model}) ga so'rov yuborilmoqda (prompt: {len(prompt)} belgi)...")
     try:
         gmodel = await _get_gemini_model_safe(api_key, model)
@@ -139,6 +175,12 @@ async def _call_gemini(
         return None, "error", "Vaqt tugadi (timeout)."
     except Exception as e:
         status, detail = _classify_gemini_error(e)
+        if status == "quota":
+            cooldown = _set_gemini_quota_cooldown(model, str(e))
+            logger.warning(
+                f"{label}: Gemini {model} kvotasi tugadi; shu modeldagi qolgan kalitlar "
+                f"{cooldown} soniya davomida qayta sinalmaydi. Boshqa provayderga o'tiladi."
+            )
         logger.error(f"{label} xato ({model}) [{status}]: {type(e).__name__}: {e}")
         return None, status, detail
 
@@ -276,6 +318,7 @@ async def ask_ai(
                     continue
                 label = f"{config.PROVIDER_LABELS.get(prov, prov.capitalize())} kalit #{idx}"
                 result, status, detail = await _dispatch(prov, key, model, "", prompt, system, history, label)
+                hisobchi.ai_call(prov, idx, model, bool(result), "ok" if result else status)
                 if result:
                     return result
                 logger.warning(f"{label} ishlamadi ({_STATUS_LABELS.get(status, status)}) — navbatdagi kalitga o'tilmoqda...")
@@ -285,6 +328,7 @@ async def ask_ai(
             key, model = cfg.get("api_key", ""), cfg.get("model", "")
             label = config.PROVIDER_LABELS.get(prov, prov.capitalize())
             result, status, detail = await _dispatch(prov, key, model, cfg.get("base_url", ""), prompt, system, history, label)
+            hisobchi.ai_call(prov, 0, model, bool(result), "ok" if result else status)
             return result
         return None  # bu provider uchun na pool, na bitta-kalit sozlamasi bor — sinab bo'lmaydi
 
@@ -313,12 +357,14 @@ async def ask_ai(
             config.DEFAULT_GROQ_KEY, config.GROQ_FALLBACK_MODEL,
             config.PROVIDER_BASE_URLS["groq"], prompt, system, history, "Standart Groq (.env)",
         )
+        hisobchi.ai_call("groq", "env", config.GROQ_FALLBACK_MODEL, bool(result), "ok" if result else status)
         if result:
             logger.info("✅ Standart Groq kaliti (.env) muvaffaqiyatli javob berdi.")
             return result
         logger.warning("Standart Groq (.env) ham ishlamadi — oxirgi chora Pollinations'ga o'tilmoqda...")
 
     result = await _call_pollinations(prompt, system)
+    hisobchi.ai_call("pollinations", 0, "", bool(result), "ok" if result else "error")
     if not result:
         logger.error(
             "❌ Barcha sozlangan AI provayderlar (asosiy + /developer orqali qo'shilgan "
@@ -352,7 +398,10 @@ async def ask_ai_with_source(
         alohida xabar berish shart emas)."""
     if user_id:
         import user_ai_keys  # aylanma import'dan qochish uchun shu yerda
-        pools = user_ai_keys.get_pools(user_id)
+        # FAQAT matn AI provayderlari: rasm provayderlari (bfl/stability) ham
+        # shaxsiy kalitlar ichida saqlanadi, lekin ular /chat/completions
+        # API'ga ega emas — matn so'rovida ishlatilmaydi (image_clients.py).
+        pools = user_ai_keys.get_text_pools(user_id)
         last_detail = ""
         for provider, pool in pools.items():
             for idx, entry in enumerate(pool, start=1):
@@ -361,6 +410,7 @@ async def ask_ai_with_source(
                     continue
                 label = f"Shaxsiy kalit ({config.PROVIDER_LABELS.get(provider, provider.capitalize())} #{idx})"
                 result, status, detail = await _dispatch(provider, key, model, "", prompt, system, history, label)
+                hisobchi.ai_call(provider, idx, model, bool(result), "ok" if result else status, source="user")
                 if result:
                     logger.info(f"🔑 {label}: ✅ ishladi (user_id={user_id}).")
                     return result, "user_key", ""
@@ -382,7 +432,8 @@ async def ask_ai_with_source(
 async def test_key(provider: str, api_key: str, model: str, index: int | None = None) -> tuple[str, str]:
     """/developer > 🔑 AI kalitlari > 🩺 Kalitlarni tekshirish uchun — bitta
     kalit/model juftligini juda qisqa so'rov bilan sinaydi (narxni minimal
-    qilish uchun). `index` berilsa, log yozuvlarida aynan qaysi kalit
+    qilish uchun). Rasm provayderlari (bfl/stability) uchun status "ok"
+    bo'lsa ham tafsilotda balans matni qaytadi. `index` berilsa, log yozuvlarida aynan qaysi kalit
     (masalan "Gemini kalit #2") ekanligi ko'rinadi — bir nechta kalit bir
     vaqtda tekshirilganda ularni farqlash uchun ZARUR (aks holda hammasi
     bir xil "Tekshiruv (Gemini)" nomi bilan logga tushib, qaysi kalit
@@ -391,6 +442,16 @@ async def test_key(provider: str, api_key: str, model: str, index: int | None = 
     label = config.PROVIDER_LABELS.get(provider, provider.capitalize())
     key_label = f"{label} kalit #{index}" if index is not None else label
     logger.info(f"🩺 Tekshiruv boshlandi: {key_label} (model: {model}).")
+    if provider in config.IMAGE_PROVIDERS:
+        # Rasm provayderlari: matn so'rovi EMAS, haqiqiy API so'rovlari
+        # (balans + model mavjudligi) — qarang: image_clients.test_image_key().
+        import image_clients  # kech import: matn AI oqimiga ta'sir qilmasin
+        status, detail = await image_clients.test_image_key(provider, api_key, model)
+        if status == "ok":
+            logger.info(f"🩺 {key_label}: ✅ ishlayapti ({detail}).")
+        else:
+            logger.warning(f"🩺 {key_label}: ❌ ishlamadi — status={status}, sabab: {detail}")
+        return status, detail
     result, status, detail = await _dispatch(provider, api_key, model, "", "Salom", "", None, f"Tekshiruv ({key_label})")
     if result:
         logger.info(f"🩺 {key_label}: ✅ ishlayapti.")
@@ -460,7 +521,11 @@ async def ask_gemini_multimodal(
     ko'rsata oladi (matn-AI chaqiruvlaridagi kabi)."""
     api_key, model_name = cfg.get("api_key", ""), cfg.get("model", "")
     if not api_key or not model_name:
-        return None, "invalid", "Kalit yoki model sozlanmagan."
+        logger.error(
+            "%s sozlama xatosi: api_key=%s model=%r",
+            label, "bor" if api_key else "YO'Q", model_name,
+        )
+        return None, "invalid", "API kalit yoki Vision model sozlanmagan."
     logger.info(f"{label} ({model_name}) ga so'rov yuborilmoqda (media: {len(media_bytes)} bayt, {mime_type})...")
     try:
         model = await _get_gemini_model_safe(api_key, model_name)

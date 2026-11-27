@@ -9,6 +9,8 @@ va natijalar PDF holida ham olinishi mumkin.
 import asyncio
 import json
 import logging
+
+from cancel_registry import cancel_markup
 import re
 
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -70,6 +72,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📋 *Test/Viktorina tuzish*\n\nQaysi mavzu bo'yicha test kerak? Mavzuni yozing:",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_markup(),
         )
     except Exception as e:
         logger.error(f"📋 Test menyusini ochishda xato (user_id={user.id if user else '?'}): {type(e).__name__}: {e}", exc_info=True)
@@ -97,7 +100,7 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     logger.info(f"📋 Test so'rovi: chat_id={chat_id}, mavzu='{topic}', savollar soni={count}.")
 
-    await query.edit_message_text(f"⏳ *{topic}* mavzusida {count} ta savol tuzilmoqda...", parse_mode=ParseMode.MARKDOWN)
+    await query.edit_message_text(f"⏳ *{topic}* mavzusida {count} ta savol tuzilmoqda...", parse_mode=ParseMode.MARKDOWN, reply_markup=cancel_markup())
 
     questions = await _generate_questions(topic, count)
     if not questions:
@@ -215,8 +218,8 @@ async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id,
         document=InputFile(pdf_buf, filename=f"test_{topic[:30]}.pdf"),
         caption=f"📋 {topic} — natija: {score}/{len(questions)}",
-        reply_markup=main_menu_keyboard(),
     )
+    await context.bot.send_message(chat_id, "🏠 Bosh menyu:", reply_markup=main_menu_keyboard())
     logger.info(f"📋 Test natijasi PDF yuborildi: chat_id={chat_id}, mavzu='{topic}'.")
     if user_id and msg.document:
         storage.record_file(user_id, "quiz_pdf", topic, msg.document.file_id)

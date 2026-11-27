@@ -1,7 +1,7 @@
 """
 💰 Foydalanuvchi uchun ICHKI BALANS interfeysi:
 - 💰 Balansim
-- ➕ Balansni to'ldirish (summa -> to'lov usuli -> chek/yo'naltirish)
+- ➕ Balansni to'ldirish (summa -> to'lov usuli -> chek yuborish)
 - 🧾 To'lovlar tarixi
 - require_payment() — pullik funksiyalarni "to'lov devori" bilan o'rab
   oluvchi dekorator (bot.py'da ishlatiladi, MAVJUD handlerlar o'zgarmaydi)
@@ -9,19 +9,39 @@
 Pul bilan bog'liq BARCHA haqiqiy amallar wallet.py (yadro moduli) orqali
 bajariladi — bu fayl faqat Telegram interfeysi (matn/tugmalar/holatlar).
 
-Chek rasmi/hujjati AI (vision) orqali FAQAT ma'lumot AJRATISH uchun
-ishlatiladi ("amount", "transaction_id" va h.k.) — AI xulosasi hech qachon
-yagona/yakuniy to'lov tasdig'i sifatida ishlatilmaydi (spetsifikatsiya
-talabi). Agar bank tomonidan avtomatik tekshiruv (payment_providers.py >
-KapitalbankTransactionVerifier) mavjud bo'lmasa yoki muvaffaqiyatsiz
-bo'lsa, to'lov albatta manual_review (admin qo'lda tekshiruvi) holatiga
-tushadi.
+🧾 CHEKNI TEKSHIRISH OQIMI (spetsifikatsiya, "🧾 Bank cheki" usuli):
+1. Foydalanuvchi chek rasmini yuboradi -> AI (vision) undan matnli
+   ma'lumot AJRATIB oladi (karta raqami, qabul qiluvchi ismi, summa).
+2. `receipt_check.verify_receipt()` shu ma'lumotni bizning rekvizitlarimiz
+   (config.PAYMENT_CARD_NUMBER / PAYMENT_CARD_HOLDER) va foydalanuvchi
+   tanlagan summa bilan SOF KOD orqali solishtiradi (AI xulosasi hech
+   qachon yakuniy tasdiq sifatida ishlatilmaydi — u faqat "o'qish" uchun).
+3a. Hammasi (karta + ism + summa + ishonchlilik) TO'G'RI bo'lsa ->
+    to'lov `auto_hold` holatiga o'tadi, adminga xabar boradi (✅/❌/⚠️
+    tugmalari bilan). Admin `config.PAYMENT_AUTO_CONFIRM_SECONDS` (standart
+    1 soat) ichida javob bermasa, `handlers/payment_auto.py` fon vazifasi
+    to'lovni AVTOMATIK qabul qiladi (`wallet.auto_confirm_payment`).
+    Admin shu muddatdan OLDIN "✅ Tasdiqlash" bossa — pul DARHOL tushadi.
+3b. Biror narsa (karta/ism/summa/ishonchlilik) MOS kelmasa -> to'lov
+    to'g'ridan-to'g'ri `manual_review`ga tushadi (avtomatik qabul YO'Q,
+    faqat admin qarori bilan tasdiqlanadi).
+4. Bot avtomatik qabul qilgandan KEYIN ham admin to'lovni SOXTA deb
+   topsa, "🚫 Soxta deb qaytarish" tugmasi orqali `wallet.revoke_payment()`
+   chaqiriladi — summa foydalanuvchi balansidan AYRILADI (agar u pulni
+   allaqachon ishlatgan bo'lsa, balans MANFIY — qarz — bo'lib qoladi).
+
+"🟠 Admin qo'lda tekshiradi" usulida bot tekshiruvi UMUMAN o'tkazilmaydi —
+chek to'g'ridan-to'g'ri manual_review'ga tushadi (foydalanuvchi ongli
+ravishda avtomatikani xohlamagan holat uchun).
 """
 
 import functools
 import json
 import logging
+
+from cancel_registry import cancel_markup
 import re
+from urllib.parse import quote
 from io import BytesIO
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
@@ -29,10 +49,13 @@ from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode, ChatAction
 
 import config
+import hisobchi  # 🧮 admin hisobchi
 import wallet
-import payment_providers
+import receipt_check
 from ai_clients import ask_gemini_multimodal
 from handlers.menu import main_menu_keyboard
+from handlers import payment_notify
+from handlers import payment_auto
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +72,18 @@ _RECEIPT_SYSTEM_PROMPT = (
     "qiluvchi yordamchisiz. Rasmda/hujjatda ko'ringan ma'lumotlarni ANIQ, "
     "hech narsa O'YLAB TOPMASDAN ajratib oling. Agar biror maydon rasmda "
     "ko'rinmasa yoki aniq bo'lmasa, uning qiymatini null qiling. "
+    "'receiver_card' — QABUL QILUVCHI (pul yuborilgan) kartaning ko'ringan "
+    "raqami (masalan \"8600 12** **** 3456\" — yashirilgan qismi bo'lsa "
+    "ham xuddi rasmda ko'ringanidek yozing, o'ylab to'ldirmang). "
+    "'receiver' — QABUL QILUVCHI (pul yuborilgan tomon) ismi (jo'natuvchi "
+    "EMAS). "
     "FAQAT quyidagi JSON formatida javob bering, boshqa hech qanday matn "
     "yozmang (izoh, markdown belgisi ‘```’ ham kerak emas):\n"
     '{"amount": <number yoki null>, "transaction_id": "<matn yoki null>", '
     '"date": "<matn yoki null>", "time": "<matn yoki null>", '
     '"sender": "<matn yoki null>", "receiver": "<matn yoki null>", '
-    '"provider": "<matn yoki null>", "confidence": <0 dan 1 gacha son>}'
+    '"receiver_card": "<matn yoki null>", "provider": "<matn yoki null>", '
+    '"confidence": <0 dan 1 gacha son>}'
 )
 
 
@@ -66,19 +95,30 @@ def _fmt_sum(amount: int) -> str:
     return f"{amount:,}".replace(",", " ") + " so'm"
 
 
+def _fmt_duration(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds % 3600 == 0:
+        h = seconds // 3600
+        return f"{h} soat" if h != 1 else "1 soat"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} daqiqa"
+    return f"{seconds} soniya"
+
+
 def insufficient_balance_text(feature_name: str, required: int, available: int) -> str:
     return (
         "❌ *Balansingiz yetarli emas.*\n\n"
         f"Funksiya: {feature_name}\n"
         f"Kerak: {_fmt_sum(required)}\n"
         f"Balans: {_fmt_sum(available)}\n\n"
-        "Balansni to'ldirish uchun pastdagi tugmani bosing."
+        "Balansni to'ldirish uchun pastdagi tugmani bosing yoki do'stlaringizni taklif qiling."
     )
 
 
 def insufficient_balance_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Balansni to'ldirish", callback_data="menu:wallet_topup")],
+        [InlineKeyboardButton("👥 Do'st taklif qilib to'ldirish", callback_data="menu:wallet_invite")],
         [InlineKeyboardButton("⬅️ Bosh menyu", callback_data="menu:back")],
     ])
 
@@ -93,6 +133,8 @@ def _status_label(status: str) -> str:
         wallet.STATUS_MANUAL_REVIEW: "⚠️ To'lov qo'lda tekshirilmoqda",
         wallet.STATUS_REJECTED: "❌ To'lov rad etildi",
         wallet.STATUS_SUSPICIOUS: "⚠️ Shubhali deb belgilangan",
+        wallet.STATUS_AUTO_HOLD: "🤖 Bot tekshirdi — admin javobi kutilmoqda",
+        wallet.STATUS_REVOKED: "🚫 Soxta deb qaytarildi",
     }.get(status, status)
 
 
@@ -128,26 +170,10 @@ async def _extract_receipt_data(image_bytes: bytes, mime_type: str) -> dict:
         return {}
 
 
-async def _notify_admins_new_receipt(context: ContextTypes.DEFAULT_TYPE, payment: dict, user) -> None:
-    if not config.ADMIN_IDS:
-        return
-    extracted = (payment.get("receipt") or {}).get("extracted") or {}
-    text = (
-        "🧾 *Yangi chek yuborildi — tekshirish kerak*\n\n"
-        f"👤 User: {user.full_name if user else '—'} (@{user.username if user and user.username else '—'})\n"
-        f"🆔 Telegram ID: `{payment['user_id']}`\n"
-        f"💰 Summa (bot ichida): {_fmt_sum(payment['amount'])}\n"
-        f"💳 Usul: {payment['method']}\n"
-        f"📌 Status: {_status_label(payment['status'])}\n\n"
-        f"🔍 Chekdan o'qilgan (AI, TASDIQ EMAS): {json.dumps(extracted, ensure_ascii=False)}\n\n"
-        f"payment_id: `{payment['payment_id']}`\n\n"
-        "/developer -> 💳 To'lovlar bo'limidan ko'rib chiqing."
-    )
-    for admin_id in config.ADMIN_IDS:
-        try:
-            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.warning(f"🧾 Adminni ({admin_id}) xabardor qilib bo'lmadi: {e}")
+async def _notify_admins_new_receipt(context: ContextTypes.DEFAULT_TYPE, payment: dict, user, file_kind=None) -> None:
+    """Admin(lar)ga: "@user hisobini X ga to'ldirdi, tasdiqlaysizmi?" +
+    ✅/❌ tugmalari + chek fayli (handlers/payment_notify.py)."""
+    await payment_notify.notify_admins_new_payment(context.bot, payment, user=user, file_kind=file_kind)
 
 
 # ============================================================
@@ -164,10 +190,48 @@ async def entry_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Balansni to'ldirish", callback_data="menu:wallet_topup")],
+            [InlineKeyboardButton("👥 Do'st taklif qilish", callback_data="menu:wallet_invite")],
             [InlineKeyboardButton("🧾 To'lovlar tarixi", callback_data="menu:wallet_history")],
             [InlineKeyboardButton("⬅️ Bosh menyu", callback_data="menu:back")],
         ]),
     )
+
+
+# ============================================================
+# 👥 Do'st taklif qilish orqali balansni to'ldirish
+# ============================================================
+
+async def entry_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    await query.answer()
+    if not user:
+        return
+    # Botning eski foydalanuvchisi ham referral egasi sifatida tanilishi kerak;
+    # oldindan ko'rilgan deb qayd etamiz, shunda welcome bonusi takrorlanmaydi.
+    try:
+        wallet.register_start(user.id, previously_seen=True)
+    except Exception:
+        logger.exception("Referral egasini ro'yxatdan o'tkazishda xato: %s", user.id)
+    username = str(getattr(__import__("config"), "BOT_USERNAME_FALLBACK", "Student_ai_uz_bot")).lstrip("@")
+    link = f"https://t.me/{username}?start=ref_{user.id}"
+    stats = wallet.referral_stats(user.id)
+    text = (
+        "👥 <b>Do‘stlarni taklif qilib balansni to‘ldirish</b>\n\n"
+        "Sizning maxsus havolangiz:\n"
+        f"<code>{link}</code>\n\n"
+        "Do‘stingiz ushbu havola orqali botga birinchi marta kirib <code>/start</code> bossa, "
+        "sizga <b>5 000 so‘m</b>, unga esa <b>10 000 so‘m</b> boshlang‘ich bonus beriladi.\n\n"
+        "⚠️ Har bir Telegram akkaunti uchun bonus faqat bir marta beriladi. "
+        "Avval botdan foydalangan odam qayta kirsa, bonus berilmaydi.\n\n"
+        f"👤 Takliflaringiz: <b>{stats['invited']}</b>\n"
+        f"💰 Takliflardan olganingiz: <b>{stats['bonus_total']:,} so‘m</b>"
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Havolani ulashish", url=f"https://t.me/share/url?url={quote(link, safe='')}")],
+        [InlineKeyboardButton("💰 Balansim", callback_data="menu:wallet_balance")],
+        [InlineKeyboardButton("⬅️ Bosh menyu", callback_data="menu:back")],
+    ]))
 
 
 # ============================================================
@@ -267,9 +331,8 @@ async def custom_amount_received(update: Update, context: ContextTypes.DEFAULT_T
 
 def _method_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Kapitalbank E-commerce", callback_data="wallet:method:ecommerce")],
-        [InlineKeyboardButton("🟡 Bank/Paynet + chek", callback_data="wallet:method:bank")],
-        [InlineKeyboardButton("🟠 Admin qo'lda tekshirishi", callback_data="wallet:method:manual")],
+        [InlineKeyboardButton("🧾 Chek yuborish (bot avval tekshiradi)", callback_data="wallet:method:bank")],
+        [InlineKeyboardButton("🟠 To'g'ridan admin tekshiradi", callback_data="wallet:method:manual")],
         [InlineKeyboardButton("⬅️ Bekor qilish", callback_data="menu:back")],
     ])
 
@@ -284,32 +347,7 @@ async def method_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Sessiya eskirgan. Iltimos, /start bilan qaytadan boshlang.")
         return ConversationHandler.END
 
-    if method_key == "ecommerce":
-        payment = wallet.create_payment(user.id, amount, provider="kapitalbank", method=wallet.METHOD_ECOMMERCE)
-        provider = payment_providers.get_ecommerce_provider()
-        await query.edit_message_text("⏳ To'lov sessiyasi yaratilmoqda...")
-        result = await provider.create_order(payment["payment_id"], amount)
-        if not result.ok:
-            wallet.set_payment_status(payment["payment_id"], wallet.STATUS_CANCELLED, reason=result.error or "")
-            await query.edit_message_text(
-                result.user_message or "⚠️ Hozircha bu usul orqali to'lov qilib bo'lmaydi.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Boshqa usulni tanlash", callback_data="menu:wallet_topup")],
-                    [InlineKeyboardButton("⬅️ Bosh menyu", callback_data="menu:back")],
-                ]),
-            )
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        await query.edit_message_text(
-            f"🟢 To'lov havolasi tayyor:\n{result.payment_url}\n\n"
-            "To'lovni amalga oshirgach, balansingiz avtomatik yangilanadi.",
-            reply_markup=main_menu_keyboard(),
-        )
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    # bank yoki manual — ikkalasida ham chek so'raladi
+    # bank (bot avval tekshiradi) yoki manual (to'g'ridan admin) — ikkalasida ham chek so'raladi
     method = wallet.METHOD_BANK_RECEIPT if method_key == "bank" else wallet.METHOD_MANUAL_RECEIPT
     payment = wallet.create_payment(user.id, amount, provider="manual", method=method)
     context.user_data["payment_id"] = payment["payment_id"]
@@ -327,10 +365,13 @@ async def method_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     note = (
-        "\n\nℹ️ Chekingiz avval avtomatik tekshirishga urinib ko'riladi, natija "
-        "bo'lmasa admin qo'lda tekshiradi."
+        "\n\nℹ️ Chekingizni bot avval o'zi tekshiradi (karta raqami, ism, summa). "
+        "Hammasi to'g'ri bo'lsa, adminga xabar boradi — admin tasdiqlasa DARHOL, "
+        f"tasdiqlamasa {_fmt_duration(config.PAYMENT_AUTO_CONFIRM_SECONDS)}dan keyin "
+        "balansingiz AVTOMATIK yangilanadi."
         if method_key == "bank" else
-        "\n\nℹ️ Chekingiz to'g'ridan-to'g'ri admin tomonidan qo'lda tekshiriladi."
+        "\n\nℹ️ Chekingiz to'g'ridan-to'g'ri admin tomonidan qo'lda tekshiriladi "
+        "(avtomatik qabul qilinmaydi)."
     )
 
     await query.edit_message_text(
@@ -387,7 +428,7 @@ async def receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Iltimos, chek RASMINI yoki PDF faylini yuboring.")
         return WT_RECEIPT
 
-    status_msg = await update.message.reply_text("⏳ Chek tahlil qilinmoqda...")
+    status_msg = await update.message.reply_text("⏳ Chek tahlil qilinmoqda...", reply_markup=cancel_markup())
 
     tg_file = await context.bot.get_file(file_id)
     bio = BytesIO()
@@ -426,28 +467,48 @@ async def receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     confidence = extracted.get("confidence") if isinstance(extracted, dict) else None
     wallet.attach_receipt(payment_id, file_id, file_unique_id, extracted=extracted, confidence=confidence)
 
-    # --- 2-usul (bank): avtomatik tekshirishga URINIB ko'riladi ---
-    verified_automatically = False
+    # --- "🧾 Chek yuborish" usuli: BOT o'zi tekshiradi (karta/ism/summa) ---
+    bot_verified = False
     if payment["method"] == wallet.METHOD_BANK_RECEIPT:
-        verifier = payment_providers.get_bank_verifier()
-        result = await verifier.verify_transaction(extracted, expected_amount=payment["amount"])
-        if result.ok:
-            wallet.confirm_payment(payment_id, actor_id="kapitalbank_verifier", source="bank_api_verified")
-            verified_automatically = True
+        check = receipt_check.verify_receipt(
+            extracted, expected_amount=payment["amount"],
+            card_number=config.PAYMENT_CARD_NUMBER, card_holder=config.PAYMENT_CARD_HOLDER,
+            min_confidence=config.PAYMENT_MIN_CONFIDENCE,
+        )
+        if check.ok:
+            due_iso = wallet.mark_auto_hold(
+                payment_id, delay_seconds=config.PAYMENT_AUTO_CONFIRM_SECONDS, bot_check=check.to_dict(),
+            )
+            if due_iso:
+                payment_auto.schedule_auto_confirm(context.application, payment_id, due_iso)
+            bot_verified = True
 
-    if verified_automatically:
+    if bot_verified:
         await status_msg.edit_text(
-            f"✅ To'lov tasdiqlandi! Balansingiz {_fmt_sum(payment['amount'])} ga oshdi.",
+            "🤖 Bot chekni tekshirdi: karta raqami, ism va summa TO'G'RI.\n\n"
+            "Admin tasdiqlasa DARHOL, tasdiqlamasa "
+            f"{_fmt_duration(config.PAYMENT_AUTO_CONFIRM_SECONDS)}dan keyin balansingiz "
+            "AVTOMATIK yangilanadi.",
             reply_markup=main_menu_keyboard(),
         )
+        await _notify_admins_new_receipt(
+            context, wallet.get_payment(payment_id), user,
+            file_kind="photo" if update.message.photo else "document",
+        )
     else:
-        wallet.mark_manual_review(payment_id, reason="Avtomatik tekshiruv mavjud emas yoki muvaffaqiyatsiz.")
+        reason = "Admin qo'lda tekshiradi (foydalanuvchi shu usulni tanladi)."
+        if payment["method"] == wallet.METHOD_BANK_RECEIPT:
+            reason = "; ".join(check.notes) or "Bot tekshiruvidan o'tmadi."
+        wallet.mark_manual_review(payment_id, reason=reason)
         await status_msg.edit_text(
             "⚠️ To'lov qo'lda tekshirilmoqda. Admin tasdiqlagach, balansingiz avtomatik "
             "yangilanadi va sizga xabar beriladi.",
             reply_markup=main_menu_keyboard(),
         )
-        await _notify_admins_new_receipt(context, wallet.get_payment(payment_id), user)
+        await _notify_admins_new_receipt(
+            context, wallet.get_payment(payment_id), user,
+            file_kind="photo" if update.message.photo else "document",
+        )
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -466,6 +527,40 @@ async def notify_user_payment_decision(bot, payment: dict, approved: bool, reaso
         await bot.send_message(payment["user_id"], text)
     except Exception as e:
         logger.warning(f"🧾 Foydalanuvchiga ({payment['user_id']}) to'lov natijasi haqida xabar berib bo'lmadi: {e}")
+
+
+async def notify_user_payment_auto_confirmed(bot, payment: dict) -> None:
+    """Bot muddat (1 soat) tugagach to'lovni O'ZI qabul qilganda foydalanuvchiga xabar."""
+    try:
+        await bot.send_message(
+            payment["user_id"],
+            f"✅ To'lovingiz avtomatik tasdiqlandi!\nBalansingiz {_fmt_sum(payment['amount'])} ga oshdi.",
+        )
+    except Exception as e:
+        logger.warning(f"🧾 Foydalanuvchiga ({payment['user_id']}) avtomatik tasdiq haqida xabar berib bo'lmadi: {e}")
+
+
+async def notify_user_payment_revoked(bot, payment: dict, new_balance: int, reason: str = "") -> None:
+    """To'lov admin tomonidan SOXTA deb topilib qaytarilganda (revoke_payment)
+    foydalanuvchiga xabar. Balans manfiy (qarz) bo'lib qolgan bo'lsa alohida ogohlantiradi."""
+    try:
+        text = (
+            f"🚫 To'lovingiz SOXTA deb topilib bekor qilindi.\n"
+            f"Balansingizdan {_fmt_sum(payment['amount'])} ayrildi."
+        )
+        if reason:
+            text += f"\nSabab: {reason}"
+        if new_balance < 0:
+            text += (
+                f"\n\n⚠️ Joriy balansingiz: -{_fmt_sum(-new_balance)}\n"
+                "Siz bu pulni allaqachon ishlatib bo'lgansiz — balansingiz QARZGA kirdi. "
+                "Keyingi to'ldirishlaringiz avval shu qarzni yopadi."
+            )
+        else:
+            text += f"\n\n💰 Joriy balansingiz: {_fmt_sum(new_balance)}"
+        await bot.send_message(payment["user_id"], text)
+    except Exception as e:
+        logger.warning(f"🧾 Foydalanuvchiga ({payment['user_id']}) qaytarish haqida xabar berib bo'lmadi: {e}")
 
 
 # ============================================================
@@ -614,6 +709,9 @@ async def finalize_success(context: ContextTypes.DEFAULT_TYPE, update: Update | 
 
     ok = wallet.complete_reservation(reservation["reservation_id"])
     price = reservation["price"]
+    if ok:
+        hisobchi.on_paid_done(update.effective_user.id if update is not None and update.effective_user else 0,
+                              reservation.get("feature_id", ""), price)
     chat = chat_id or (update.effective_chat.id if update is not None else None)
     if ok and chat is not None:
         text = f"✅ Tayyor!\n💰 {_fmt_sum(price)} yechildi."
@@ -641,6 +739,9 @@ async def finalize_failure(context: ContextTypes.DEFAULT_TYPE, update: Update | 
 
     ok = wallet.release_reservation(reservation["reservation_id"], reason=reason or "xizmat muvaffaqiyatsiz tugadi")
     price = reservation["price"]
+    if ok:
+        hisobchi.on_job_fail(update.effective_user.id if update is not None and update.effective_user else 0,
+                             reservation.get("feature_id", ""), reason)
     chat = chat_id or (update.effective_chat.id if update is not None else None)
     if ok and chat is not None:
         text = f"❌ Xizmatni bajarishda xatolik yuz berdi.\n💰 {_fmt_sum(price)} hisobingizga qaytarildi."

@@ -5,6 +5,7 @@
 - Telegram video/document file_id saqlanadi; kino qayta yuklanmaydi.
 """
 
+import html
 import logging
 import os
 import asyncio
@@ -26,6 +27,31 @@ KINO_WAIT_TITLE = 2
 
 def _is_admin(user_id: int) -> bool:
     return int(user_id) in config.ADMIN_IDS
+
+
+# Brauzer (Mini App) va Android VideoView faqat H.264/AAC MP4 ni ishonchli ijro etadi.
+# MKV/AVI kabi formatlar katalogga qo'shilsa-yu, hech qaerda ochilmasdi.
+_OK_EXT = {".mp4", ".m4v"}
+_OK_MIME = {"video/mp4", "video/x-m4v"}
+_RISKY_EXT = {".mov", ".webm", ".3gp"}
+_RISKY_MIME = {"video/quicktime", "video/webm", "video/3gpp"}
+_CONVERT_HINT = (
+    "Kompyuterda o'tkazish uchun:\n"
+    "ffmpeg -i kirish.mkv -c:v libx264 -c:a aac -movflags +faststart chiqish.mp4"
+)
+
+
+def _classify_video(media) -> str:
+    """'ok' | 'risky' | 'bad' — fayl brauzer/Androidda ijro etilish ehtimoli bo'yicha."""
+    ext = os.path.splitext((getattr(media, "file_name", "") or "").lower())[1]
+    mime = (getattr(media, "mime_type", "") or "").lower()
+    if ext in _OK_EXT or mime in _OK_MIME:
+        return "ok"
+    if ext in _RISKY_EXT or mime in _RISKY_MIME:
+        return "risky"
+    if not ext and not mime:
+        return "ok"     # Telegram'ning o'zi siqqan video (mime yo'q) — odatda MP4
+    return "bad"
 
 
 def _menu_markup() -> InlineKeyboardMarkup:
@@ -58,7 +84,7 @@ async def kino_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("kino_pending", None)
         await q.edit_message_text(
             "🎬 Kino yuklash\n\n"
-            "1️⃣ Video yoki video faylni shu yerga yuboring.\n"
+            "1️⃣ Video yoki video faylni shu yerga yuboring (H.264/AAC MP4 tavsiya etiladi; MKV/AVI ochilmaydi).\n"
             "2️⃣ Keyin kino nomini so'rayman.\n\n"
             "📡 Media Telegramdan MTProto orqali oqimlanadi; fayl Render/R2 ga saqlanmaydi."
         )
@@ -83,6 +109,14 @@ async def kino_receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return KINO_WAIT_VIDEO
     if msg.document and not (msg.document.mime_type or "").lower().startswith("video/"):
         await msg.reply_text("❌ Video fayl yuboring.")
+        return KINO_WAIT_VIDEO
+    quality = _classify_video(source_media)
+    if quality == "bad":
+        kind = source_media.mime_type or os.path.splitext(source_media.file_name or "")[1] or "noma'lum"
+        await msg.reply_text(
+            f"❌ Bu format ({kind}) brauzer va Android ilovasida ochilmaydi.\n"
+            "Kino H.264 video + AAC audio bilan MP4 bo'lishi kerak.\n\n" + _CONVERT_HINT
+        )
         return KINO_WAIT_VIDEO
 
     # Kino avval maxsus kanalga ko'chiriladi. Keyingi katalog va MTProto
@@ -112,10 +146,15 @@ async def kino_receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "size": source_media.file_size or 0,
     }
     suggested = os.path.splitext(source_media.file_name or "")[0] if source_media.file_name else ""
-    await msg.reply_text(
-        "✅ Video kino kanaliga saqlandi.\n\n"
-        + ("📝 Endi kino nomini yuboring." + (f"\n\nMasalan: `{suggested}`" if suggested else ""))
-    )
+    text = "✅ Video kino kanaliga saqlandi.\n\n📝 Endi kino nomini yuboring."
+    if suggested:
+        text += f"\n\nMasalan: <code>{html.escape(suggested)}</code>"
+    if quality == "risky":
+        text += (
+            "\n\n⚠️ Bu format (MOV/WebM/3GP) ba'zi qurilmalarda ochilmasligi mumkin. "
+            "Ishonchli ijro uchun H.264/AAC MP4 tavsiya etiladi.\n" + _CONVERT_HINT
+        )
+    await msg.reply_text(text, parse_mode="HTML")
     return KINO_WAIT_TITLE
 
 async def kino_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,13 +170,18 @@ async def kino_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Yuklash sessiyasi topilmadi. /kino buyrug'ini qayta bering.")
         return ConversationHandler.END
 
-    # Stage 2: aynan shu Telegram message'ni MTProto orqali resolve qilamiz.
-    # Media baytlari olinmaydi — faqat identifierlar DB'ga yoziladi.
+    # Kino nusxasi saqlash kanalida turibdi: stream uchun kerakli manba (chat_id +
+    # message_id) bizga allaqachon ma'lum. MTProto esa faqat TASDIQLASH va metadata
+    # uchun; u xato bersa ham manba identifikatorlari saqlanadi (aks holda kino
+    # "MTProto ma'lumotsiz" yozilib, oqim umuman ishlamay qolardi).
+    source_chat_id = int(pending["source_chat_id"])
+    source_message_id = int(pending["source_message_id"])
     mtproto_meta = {}
+    mtproto_error = ""
     try:
-        mtproto_meta = await telegram_mtproto.resolve_message(
-            chat_id=int(pending["source_chat_id"]),
-            message_id=int(pending["source_message_id"]),
+        mtproto_meta = await asyncio.wait_for(
+            telegram_mtproto.resolve_message(chat_id=source_chat_id, message_id=source_message_id),
+            timeout=90,
         )
         logger.info(
             "🎬 Kino MTProto metadata olindi: chat=%s message=%s document=%s",
@@ -146,40 +190,48 @@ async def kino_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE)
             mtproto_meta.get("telegram_document_id"),
         )
     except Exception as exc:
-        # Hozircha katalogni to'xtatmaymiz: eski file_id saqlanadi.
-        # Keyingi migration bosqichida eski yozuvlarni ham MTProto bilan
-        # to'ldirish uchun alohida resolver qo'shiladi.
-        logger.warning("🎬 MTProto metadata olinmadi: %s: %s", type(exc).__name__, exc)
+        mtproto_error = f"{type(exc).__name__}: {exc}"[:300]
+        logger.warning("🎬 MTProto metadata olinmadi: %s", mtproto_error)
 
+    size = int(mtproto_meta.get("size") or pending.get("size") or 0)
     movie = storage.add_movie(
         title=title,
         file_id=pending["file_id"],
         mime_type=mtproto_meta.get("mime_type") or pending.get("mime_type") or "video/mp4",
         file_name=mtproto_meta.get("file_name") or pending.get("file_name") or "",
-        size=mtproto_meta.get("size") or pending.get("size") or 0,
+        size=size,
         uploaded_by=update.effective_user.id,
-        telegram_chat_id=mtproto_meta.get("telegram_chat_id"),
-        telegram_message_id=mtproto_meta.get("telegram_message_id"),
+        telegram_chat_id=mtproto_meta.get("telegram_chat_id") or source_chat_id,
+        telegram_message_id=mtproto_meta.get("telegram_message_id") or source_message_id,
         telegram_document_id=mtproto_meta.get("telegram_document_id"),
         telegram_access_hash=mtproto_meta.get("telegram_access_hash"),
         telegram_file_reference=mtproto_meta.get("telegram_file_reference", ""),
         telegram_file_unique_id=mtproto_meta.get("telegram_file_unique_id") or pending.get("file_unique_id", ""),
     )
 
-    # Stage 3: kino baytlari R2/Render diskiga ko'chirilmaydi.
-    # Telegram MTProto stream asosiy manba; Bot API proxy faqat avtomatik fallback.
-    r2_note = "\n📡 Media: Telegram MTProto oqimi (Render disk/R2 ga saqlanmaydi)."
-
     context.user_data.pop("kino_pending", None)
 
+    if not mtproto_error:
+        status = "📡 Media: Telegram MTProto oqimi (kanal tekshirildi ✅, Render diskiga saqlanmaydi)."
+    else:
+        status = (
+            "⚠️ MTProto tekshiruvi o'tmadi: " + html.escape(mtproto_error) + "\n"
+            "Kino saqlandi va kanal xabariga bog'landi, lekin MTProto tuzalmaguncha oqim "
+            "Bot API zaxirasiga tayanadi (u faqat ~20 MB gacha fayllarda ishlaydi). "
+            "Sababni /kino_check bilan tekshiring."
+        )
+    if size <= 0:
+        status += "\n⚠️ Fayl hajmi aniqlanmadi — hajmsiz kinoni oqimlab bo'lmaydi."
+
+    bot_name = html.escape(str(config.BOT_USERNAME_FALLBACK))
     await update.message.reply_text(
-        f"✅ Kino katalogga qo'shildi!{r2_note}\n\n"
-        f"🎬 {movie['title']}\n"
-        f"🆔 {movie['id']}\n\n"
-        f"Endi `@{config.BOT_USERNAME_FALLBACK} kino` yoki "
-        f"`@{config.BOT_USERNAME_FALLBACK} kino {movie['title']}` orqali topiladi.",
+        f"✅ Kino katalogga qo'shildi!\n{status}\n\n"
+        f"🎬 {html.escape(movie['title'])}\n"
+        f"🆔 {html.escape(str(movie['id']))}\n\n"
+        f"Endi <code>@{bot_name} kino</code> yoki "
+        f"<code>@{bot_name} kino {html.escape(movie['title'])}</code> orqali topiladi.",
         reply_markup=_menu_markup(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     return KINO_MENU
 
@@ -317,9 +369,9 @@ async def kino_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await q.answer()
     # Admin katalogidan ham foydalanuvchi Mini App orqali ko'rishi mumkin.
-    room_id = movie_watch.create_room(movie_id, q.from_user.id)
+    room_id = movie_watch.find_or_create_room(movie_id, q.from_user.id)
     if not room_id:
-        await q.answer("Xona yaratib bo'lmadi.", show_alert=True)
+        await q.answer("Xona yaratib bo'lmadi (faol xonalar ko'p bo'lishi mumkin).", show_alert=True)
         return
     url = movie_watch.room_url(movie_id, room_id)
     await q.edit_message_text(
@@ -327,4 +379,145 @@ async def kino_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Kino oldindan katalogga yuklangan. Qayta yuklash shart emas.\n"
         "👇 Tomosha qilish uchun oching:",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Kino ko'rish", url=url)]]),
+    )
+
+
+async def kino_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun: MTProto session kino saqlash kanalini va kinolarni ocha oladimi?
+
+    Foydalanish: /kino_check
+    Secretlar va media baytlari ko'rsatilmaydi.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not _is_admin(user.id):
+        await msg.reply_text("⛔ Faqat admin uchun.")
+        return
+
+    lines = ["🔎 Kino MTProto diagnostikasi", ""]
+    if not telegram_mtproto.is_configured():
+        lines.append("❌ MTProto sozlanmagan (TG_API_ID / TG_API_HASH / TG_SESSION).")
+        lines.append("Oqim faqat Bot API zaxirasida ishlaydi (≤20 MB).")
+        await msg.reply_text("\n".join(lines))
+        return
+
+    async def _check(chat_id, message_id=None):
+        try:
+            return await asyncio.wait_for(telegram_mtproto.check_storage(chat_id, message_id), timeout=90)
+        except asyncio.TimeoutError:
+            return False, "vaqt tugadi (90s)"
+
+    ok, detail = await _check(config.KINO_STORAGE_CHANNEL_ID)
+    lines.append(f"{'✅' if ok else '❌'} Saqlash kanali ({config.KINO_STORAGE_CHANNEL_ID}): {detail[:250]}")
+
+    movies = storage.search_movies("")
+    linked = [m for m in movies if m.get("telegram_chat_id") and m.get("telegram_message_id") and int(m.get("size") or 0) > 0]
+    lines.append(f"🎬 Jami kino: {len(movies)}, MTProto oqimiga tayyor: {len(linked)}, "
+                 f"eski/ulanmagan: {len(movies) - len(linked)}")
+    for m in linked[:3]:
+        ok_m, detail_m = await _check(int(m["telegram_chat_id"]), int(m["telegram_message_id"]))
+        lines.append(f"{'✅' if ok_m else '❌'} {str(m.get('title'))[:40]}: {detail_m[:200]}")
+    if len(movies) - len(linked):
+        lines.append("")
+        lines.append("Eski kinolarni ulash: /kino_migration MOVIE_ID CHAT_ID MESSAGE_ID")
+    if not ok:
+        lines.append("")
+        lines.append("Yechim: session akkaunti saqlash kanaliga a'zo bo'lishi (yoki kanal public "
+                     "username'ga ega bo'lishi) va KINO_STORAGE_CHANNEL_ID to'g'ri bo'lishi kerak.")
+    await msg.reply_text("\n".join(lines))
+
+
+_QUALITY_LIST = ("1080", "720", "480")
+
+
+async def kino_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: kinoga boshqa sifatdagi (1080/720/480) variantni ulaydi.
+
+    Foydalanish:
+      /kino_quality                                    -> yordam va ulangan variantlar
+      /kino_quality MOVIE_ID 480 CHAT_ID MESSAGE_ID    -> 480p variantni ulash
+      /kino_quality MOVIE_ID 480 off                   -> variantni olib tashlash
+
+    Server videoni o'zi qayta kodlamaydi (Render'da og'ir). Past sifatli fayl kompyuterda
+    tayyorlanib, saqlash kanaliga yuklanadi, so'ng shu buyruq bilan kinoga ulanadi.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not _is_admin(user.id):
+        await msg.reply_text("⛔ Faqat admin uchun.")
+        return
+
+    args = list(context.args or [])
+    if not args:
+        lines = [
+            "🎞 Kino sifat variantlari",
+            "",
+            "Ulash: /kino_quality MOVIE_ID 480 CHAT_ID MESSAGE_ID",
+            "Olib tashlash: /kino_quality MOVIE_ID 480 off",
+            "",
+            "480p tayyorlash (kompyuterda):",
+            "ffmpeg -i kino.mp4 -vf scale=-2:480 -c:v libx264 -crf 26 -c:a aac -movflags +faststart kino_480.mp4",
+            "Faylni saqlash kanaliga yuboring, xabar ID'sini oling va yuqoridagi buyruq bilan ulang.",
+            "",
+        ]
+        for m in storage.search_movies("")[:30]:
+            have = ", ".join(f"{q}p" for q in _QUALITY_LIST if (m.get("variants") or {}).get(q)) or "faqat asl"
+            lines.append(f"🎬 {m['title'][:40]} — {m['id']} — {have}")
+        await msg.reply_text("\n".join(lines))
+        return
+
+    if len(args) < 3:
+        await msg.reply_text("❌ Format: /kino_quality MOVIE_ID 480 CHAT_ID MESSAGE_ID")
+        return
+    movie_id, quality = args[0], args[1].lower().rstrip("p")
+    movie = storage.get_movie(movie_id)
+    if not movie:
+        await msg.reply_text("❌ Bunday kino ID topilmadi.")
+        return
+    if quality not in _QUALITY_LIST:
+        await msg.reply_text("❌ Sifat 1080, 720 yoki 480 bo'lishi kerak.")
+        return
+
+    variants = dict(movie.get("variants") or {})
+    if args[2].lower() in ("off", "o'chir", "ochir", "delete"):
+        variants.pop(quality, None)
+        storage.update_movie(movie_id, variants=variants)
+        await msg.reply_text(f"✅ {quality}p varianti olib tashlandi.")
+        return
+
+    if len(args) != 4:
+        await msg.reply_text("❌ Format: /kino_quality MOVIE_ID 480 CHAT_ID MESSAGE_ID")
+        return
+    try:
+        chat_id, message_id = int(args[2]), int(args[3])
+        if message_id <= 0:
+            raise ValueError
+    except ValueError:
+        await msg.reply_text("❌ CHAT_ID va MESSAGE_ID raqam bo'lishi kerak.")
+        return
+    try:
+        meta = await asyncio.wait_for(
+            telegram_mtproto.resolve_message(chat_id=chat_id, message_id=message_id), timeout=90)
+    except Exception as exc:
+        logger.warning("🎬 kino_quality resolve xato: %s: %s", type(exc).__name__, exc)
+        await msg.reply_text(f"❌ Telegram xabarini MTProto orqali olib bo'lmadi.\nSabab: {type(exc).__name__}: {exc}")
+        return
+    if not meta.get("telegram_document_id") or int(meta.get("size") or 0) <= 0:
+        await msg.reply_text("❌ Bu xabarda oqimlanadigan video topilmadi yoki hajmi noma'lum.")
+        return
+
+    variants[quality] = {
+        "telegram_chat_id": meta.get("telegram_chat_id") or chat_id,
+        "telegram_message_id": meta.get("telegram_message_id") or message_id,
+        "size": int(meta.get("size") or 0),
+        "mime_type": meta.get("mime_type") or "video/mp4",
+    }
+    storage.update_movie(movie_id, variants=variants)
+    await msg.reply_text(
+        f"✅ {quality}p varianti ulandi.\n🎬 {movie['title']}\n📦 {variants[quality]['size']} bayt\n\n"
+        "Endi xona egasi sozlamalardan shu sifatni tanlay oladi."
     )

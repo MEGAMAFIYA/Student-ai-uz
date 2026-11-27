@@ -17,6 +17,11 @@ import logging
 import os
 import base64
 import re
+import threading
+import atexit
+import time
+import uuid
+from contextlib import contextmanager
 import httpx
 from dotenv import load_dotenv
 
@@ -30,6 +35,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 # ============================================================
 # Render API key Account Settings > API Keys'dan olinadi. Hech qachon
 # kodga hardcode qilinmaydi yoki GitHub'ga commit qilinmaydi.
+#
+# Bir nechta Render hisobini ulash uchun .env (yoki Render Environment
+# Variables) ichida ketma-ket raqamlangan kalitlarni qo'ying:
+#   RENDER_API_KEY=...      (1-hisob, raqamsiz — orqaga moslik uchun)
+#   RENDER_API_KEY2=...     (2-hisob)
+#   RENDER_API_KEY3=...     (3-hisob)
+#   ...                     (xohlagancha davom ettirish mumkin)
+# Har bir kalitga mos ixtiyoriy sozlamalar ham xuddi shu tartibda raqamlanadi:
+#   RENDER_OWNER_ID / RENDER_OWNER_ID2 / RENDER_OWNER_ID3 ...
+#   RENDER_SERVICE_ID / RENDER_SERVICE_ID2 / RENDER_SERVICE_ID3 ...
+#   RENDER_ACCOUNT_NAME / RENDER_ACCOUNT_NAME2 / ... (panelda ko'rinadigan nom)
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
 # Ixtiyoriy: tea-... workspace ID. Bo'sh bo'lsa /developer > RENDER
 # API orqali ko'rinadigan servislarning ownerId qiymatidan avtomatik aniqlaydi.
@@ -39,6 +55,54 @@ RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
 # PDF uchun qancha vaqt ichidagi Render loglari olinadi. Render log retention
 # workspace rejasiga bog'liq; API mavjud bo'lgan davr ichidan shu oynani oladi.
 RENDER_LOG_PDF_HOURS = max(1, int(os.getenv("RENDER_LOG_PDF_HOURS", "168")))
+
+
+def _load_render_accounts() -> list[dict[str, str]]:
+    """RENDER_API_KEY, RENDER_API_KEY2, RENDER_API_KEY3, ... dan bir nechta
+    Render hisobini o'qiydi va har biri uchun mustaqil sozlamalar to'plamini
+    qaytaradi. Kalitlar tugagunga qadar (bo'sh qiymat topilguncha) davom
+    ettiriladi, shuning uchun xohlagancha hisob qo'shish mumkin.
+    """
+    accounts: list[dict[str, str]] = []
+
+    if RENDER_API_KEY:
+        accounts.append({
+            "id": "1",
+            "label": os.getenv("RENDER_ACCOUNT_NAME", "").strip() or "Render #1",
+            "key": RENDER_API_KEY,
+            "owner_id": RENDER_OWNER_ID,
+            "service_id": RENDER_SERVICE_ID,
+        })
+
+    n = 2
+    while True:
+        key = os.getenv(f"RENDER_API_KEY{n}", "").strip()
+        if not key:
+            break
+        accounts.append({
+            "id": str(n),
+            "label": os.getenv(f"RENDER_ACCOUNT_NAME{n}", "").strip() or f"Render #{n}",
+            "key": key,
+            "owner_id": os.getenv(f"RENDER_OWNER_ID{n}", "").strip(),
+            "service_id": os.getenv(f"RENDER_SERVICE_ID{n}", "").strip(),
+        })
+        n += 1
+
+    return accounts
+
+
+# Ulangan barcha Render hisoblari ro'yxati (har biri {id, label, key, owner_id,
+# service_id}). Bo'sh bo'lishi ham mumkin — /developer > RENDER shuni tekshiradi.
+RENDER_ACCOUNTS: list[dict[str, str]] = _load_render_accounts()
+
+
+def get_render_account(account_id: str) -> dict[str, str] | None:
+    """Berilgan id ('1', '2', ...) bo'yicha Render hisobini qaytaradi."""
+    account_id = str(account_id)
+    for account in RENDER_ACCOUNTS:
+        if account["id"] == account_id:
+            return account
+    return None
 
 
 # /developer buyrug'iga faqat shu Telegram user_id'larga ruxsat beriladi.
@@ -68,7 +132,18 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 # 🎬 /kino — kino katalogi + Mini App
 # ============================================================
 # Kino fayli uchun alohida upload-limit yo'q: media Telegram source message sifatida qoladi.
+# Xona FAOL BO'LMAY qolgach (hech kim so'rov yubormasa) shuncha soniyadan keyin o'chadi.
+# Film davomida mijozlar har soniya so'rov yuborgani uchun xona faol hisoblanadi.
 KINO_ROOM_TTL_SEC = int(os.getenv("KINO_ROOM_TTL_SEC", str(6 * 60 * 60)))
+# Faol xona ham shu umrdan oshib ketmasin (xotira oqib ketmasligi uchun).
+KINO_ROOM_MAX_AGE_SEC = max(KINO_ROOM_TTL_SEC, int(os.getenv("KINO_ROOM_MAX_AGE_SEC", str(24 * 60 * 60))))
+# Mini App initData'si kino sessiyasi davomida shuncha vaqt yaroqli hisoblanadi.
+# Telegram initData'ni Mini App ochiq turganda yangilamaydi, shuning uchun 1 soatlik
+# umumiy limit uzun filmlarni (2-3 soat) o'rtasida uzib qo'yardi.
+KINO_INIT_DATA_MAX_AGE_SEC = max(3600, int(os.getenv("KINO_INIT_DATA_MAX_AGE_SEC", str(24 * 60 * 60))))
+# Stream tokenining umri. Haqiqiy himoya xona + ishtirokchi tekshiruvi; token faqat
+# qo'shimcha imzo. Eng uzun film + zaxira bo'lishi uchun xona TTL'idan kam bo'lmasin.
+KINO_STREAM_TOKEN_TTL_SEC = max(3600, int(os.getenv("KINO_STREAM_TOKEN_TTL_SEC", str(12 * 60 * 60))))
 # Ixtiyoriy: BotFather > Mini App uchun short name. Bo'sh bo'lsa Main Mini App ishlatiladi.
 KINO_APP_SHORT_NAME = os.getenv("KINO_APP_SHORT_NAME", "").strip()
 # Ixtiyoriy WebRTC TURN. STUN ko‘p tarmoqlarda yetarli, lekin mobil/operator NAT
@@ -214,8 +289,20 @@ KINO_STREAM_TOKEN_SECRET = os.getenv("KINO_STREAM_TOKEN_SECRET", "")
 # Kino stream xavfsizligi/performance sozlamalari. Media fayli diskka
 # yozilmaydi; bu limitlar faqat bir vaqtdagi RAM/chunk yuklamasini boshqaradi.
 KINO_STREAM_CHUNK_SIZE = max(64 * 1024, int(os.getenv("KINO_STREAM_CHUNK_SIZE", str(1024 * 1024))))
-KINO_STREAM_MAX_CONCURRENT = max(1, int(os.getenv("KINO_STREAM_MAX_CONCURRENT", "4")))
+KINO_STREAM_MAX_CONCURRENT = max(1, int(os.getenv("KINO_STREAM_MAX_CONCURRENT", "8")))
 KINO_STREAM_TIMEOUT_SEC = max(5, int(os.getenv("KINO_STREAM_TIMEOUT_SEC", "35")))
+# Oldindan yuklanadigan chunklar soni (har biri KINO_STREAM_CHUNK_SIZE). RAM: prefetch * chunk * oqimlar.
+KINO_STREAM_PREFETCH = max(1, min(16, int(os.getenv("KINO_STREAM_PREFETCH", "4"))))
+# Bitta Range javobi shuncha baytdan oshmaydi: brauzer qolganini keyingi so'rov bilan oladi.
+# Bu bitta ulanish butun filmni ushlab turishini (va umumiy oqim limitini band qilishini) oldini oladi.
+KINO_STREAM_MAX_RESPONSE_BYTES = max(256 * 1024, int(os.getenv("KINO_STREAM_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024))))
+# Xotiradagi xonalar soni cheklovi va hech kim kirmagan xonalar uchun qisqa umr (inline natijalar uchun).
+KINO_MAX_ROOMS = max(10, int(os.getenv("KINO_MAX_ROOMS", "500")))
+# Egalik: vaqtinchalik egalik muddati, so'rov kutish muddati, onlayn deb hisoblash oynasi (soniya).
+KINO_TEMP_OWNER_SEC = max(10, int(os.getenv("KINO_TEMP_OWNER_SEC", "60")))
+KINO_OWNER_REQUEST_TTL_SEC = max(10, int(os.getenv("KINO_OWNER_REQUEST_TTL_SEC", "45")))
+KINO_PRESENCE_SEC = max(8, int(os.getenv("KINO_PRESENCE_SEC", "25")))
+KINO_UNUSED_ROOM_TTL_SEC = max(60, int(os.getenv("KINO_UNUSED_ROOM_TTL_SEC", str(30 * 60))))
 
 TG_SEARCH_ENABLED = bool(TG_API_ID and TG_API_HASH and TG_SESSION and TG_SEARCH_CHANNELS)
 
@@ -322,9 +409,16 @@ def _cfg(prefix: str, default_model: str, default_provider: str = "gemini") -> d
     else:
         default_key = DEFAULT_GEMINI_KEY
 
+    # Maxsus funksiya kaliti umumiy GEMINI_API_KEY dan ustun turadi.
+    # Masalan VISION_API_KEY berilgan bo'lsa, rasm baholash aynan shu
+    # kalitdan foydalanadi. Bu Render konfiguratsiyasini aniq va bashoratli
+    # qiladi.
+    function_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+    if not function_key and prefix == "VISION":
+        function_key = os.getenv("VISION_API_KEY", "").strip()
     return {
         "provider": provider,
-        "api_key": os.getenv(f"{prefix}_API_KEY", default_key),
+        "api_key": function_key or default_key,
         "model": os.getenv(f"{prefix}_MODEL", default_model),
         "base_url": os.getenv(f"{prefix}_BASE_URL", ""),
     }
@@ -405,6 +499,15 @@ SUPPORTED_PROVIDERS = [
     "cloudflare", "sambanova", "cohere", "huggingface", "nvidia", "vercel",
 ]
 
+# 🎨 RASM yaratish provayderlari (matn AI emas!). Ular /chat/completions API'ga
+# ega EMAS, shuning uchun SUPPORTED_PROVIDERS (matn AI zaxira zanjiri) ichiga
+# QO'SHILMAGAN — aks holda ai_clients.ask_ai() ularga matn so'rovi yuborishga
+# urinardi. Kalit boshqaruvi (/developer, /my) esa ALL_KEY_PROVIDERS bo'yicha
+# ishlaydi: ya'ni kalit qo'shish/almashtirish/o'chirish/tekshirish BIR XIL
+# menyuda, KEY_POOLS va user_ai_keys saqlash mexanizmi orqali.
+IMAGE_PROVIDERS = ["bfl", "stability"]
+ALL_KEY_PROVIDERS = SUPPORTED_PROVIDERS + IMAGE_PROVIDERS
+
 # /developer menyusida tugma va matnlarda ko'rsatiladigan to'liq nom
 # (berilmagan provider uchun oddiy .capitalize() ishlatiladi).
 PROVIDER_LABELS = {
@@ -419,6 +522,8 @@ PROVIDER_LABELS = {
     "huggingface": "Hugging Face",
     "nvidia": "NVIDIA NIM",
     "vercel": "Vercel AI Gateway",
+    "bfl": "Black Forest Labs",
+    "stability": "Stability AI",
 }
 
 # Har bir provider uchun BEPUL API kalit olinadigan rasmiy sahifa —
@@ -435,6 +540,8 @@ PROVIDER_KEY_LINKS = {
     "huggingface": "https://huggingface.co/settings/tokens",
     "nvidia": "https://build.nvidia.com",
     "vercel": "https://vercel.com/docs/ai-gateway",
+    "bfl": "https://api.bfl.ai (Dashboard > API Keys; hujjat: https://docs.bfl.ai/)",
+    "stability": "https://platform.stability.ai/account/keys",
 }
 
 # OpenAI-mos provayderlarning standart /v1 bazaviy manzili. Gemini google SDK
@@ -468,6 +575,8 @@ DEFAULT_MODEL_BY_PROVIDER = {
     "huggingface": "meta-llama/Llama-3.1-8B-Instruct",
     "nvidia": "meta/llama-3.1-8b-instruct",
     "vercel": "openai/gpt-4o-mini",
+    "bfl": "flux-2-pro",        # rasm yaratish (image_clients.py)
+    "stability": "core",        # rasm yaratish (image_clients.py)
 }
 
 MAX_TELEGRAM_TEXT = 3800
@@ -485,7 +594,106 @@ REMINDER_TZ_OFFSET_HOURS = float(os.getenv("REMINDER_TZ_OFFSET_HOURS", "5"))
 # Ro'yxat TARTIBI muhim — 1-kalit, 2-kalit... shu tartibda birin-ketin
 # sinaladi (ai_clients.ask_ai ichida). Bo'sh ro'yxat — pool ishlatilmaydi,
 # o'sha holda AI_FUNCTIONS'dagi eski bitta-kalit rejimi ishlaydi (moslik uchun).
-KEY_POOLS: dict[str, list[dict]] = {p: [] for p in SUPPORTED_PROVIDERS}
+KEY_POOLS: dict[str, list[dict]] = {p: [] for p in ALL_KEY_PROVIDERS}
+
+# AL Yordamchi uchun foydalanuvchi kesimidagi maxsus kalitlar.
+# Bu pool bot funksiyalarining KEY_POOLS ro'yxatidan butunlay mustaqil.
+# Kalitlar {str(user_id): {"provider": ..., "key": ..., "model": ...}} ko'rinishida.
+AL_USER_KEYS: dict[str, dict] = {}
+_AL_USER_KEYS_LOCK = threading.RLock()
+_RUNTIME_CONFIG_WRITE_LOCK = threading.RLock()
+
+
+def get_al_user_key(user_id: int, provider: str | None = None) -> dict:
+    """Faqat ko'rsatilgan egaga tegishli AL kalitini qaytaradi (copy)."""
+    with _AL_USER_KEYS_LOCK:
+        entry = dict(AL_USER_KEYS.get(str(int(user_id))) or {})
+    if provider and entry.get("provider") != provider:
+        return {}
+    return entry
+
+
+def set_al_user_key(user_id: int, provider: str, api_key: str, model: str = "") -> bool:
+    """AL kalitini egaga bog'lab, KEY_POOLS'dan alohida doimiy saqlaydi."""
+    if not has_durable_runtime_storage():
+        logger.error("[AL KEY] Doimiy saqlash sozlanmagan; user_id=%s kaliti saqlanmadi.", user_id)
+        return False
+    if provider not in SUPPORTED_PROVIDERS or not str(api_key or "").strip():
+        return False
+    uid = str(int(user_id))
+    with _RUNTIME_CONFIG_WRITE_LOCK, _AL_USER_KEYS_LOCK:
+        previous = dict(AL_USER_KEYS.get(uid) or {})
+        AL_USER_KEYS[uid] = {
+            "provider": provider,
+            "key": str(api_key).strip(),
+            "model": str(model or (previous.get("model") if previous.get("provider") == provider else "") or "").strip(),
+        }
+        saved = _save_runtime_overrides()
+        if not saved:
+            AL_USER_KEYS[uid] = previous
+            return False
+    logger.info("[AL KEY] Shaxsiy AL kaliti saqlandi: owner=%s provider=%s", user_id, provider)
+    return True
+
+
+def delete_al_user_key(user_id: int) -> bool:
+    uid = str(int(user_id))
+    with _RUNTIME_CONFIG_WRITE_LOCK, _AL_USER_KEYS_LOCK:
+        previous = AL_USER_KEYS.pop(uid, None)
+        if previous is None:
+            return True
+        if not _save_runtime_overrides():
+            AL_USER_KEYS[uid] = previous
+            return False
+    return True
+
+# ============================================================
+# 🖼 KURS ISHI RASMLARI — ADMINISTRATOR STANDART SOZLAMALARI
+# ============================================================
+# Foydalanuvchi kurs ishi yaratishda rasm sozlamalarini tanlamasa, shu
+# qiymatlar ishlaydi (/developer > 🔑 Kalitlar > 🖼 Kurs ishi rasmlari orqali
+# o'zgartiriladi va KEY_POOLS kabi doimiy saqlanadi).
+#   enabled  — rasmlarni yaratish yoqilganmi
+#   provider — "auto" | "bfl" | "stability"
+#   model    — "" = provayderning standart modeli (DEFAULT_MODEL_BY_PROVIDER)
+#   count    — 1..5 (diagrammalar + AI illyustratsiyalar jami)
+COURSE_IMAGE_COUNT_MIN, COURSE_IMAGE_COUNT_MAX = 1, 5
+COURSE_IMAGE_DEFAULTS: dict = {
+    "enabled": os.getenv("COURSE_IMAGES_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no"),
+    "provider": os.getenv("COURSE_IMAGES_PROVIDER", "auto").strip().lower() or "auto",
+    "model": os.getenv("COURSE_IMAGES_MODEL", "").strip(),
+    "count": 3,
+}
+
+
+def sanitize_course_image_settings(raw: dict | None, base: dict | None = None) -> dict:
+    """Istalgan (foydalanuvchi/admin/saqlangan) sozlamani XAVFSIZ shaklga keltiradi.
+    Noto'g'ri/yo'q maydonlar `base` (yoki admin standarti) dan olinadi."""
+    base = base if base is not None else COURSE_IMAGE_DEFAULTS
+    raw = raw if isinstance(raw, dict) else {}
+    out = {
+        "enabled": bool(base.get("enabled", True)),
+        "provider": str(base.get("provider", "auto")),
+        "model": str(base.get("model", "")),
+        "count": int(base.get("count", 3)),
+    }
+    if "enabled" in raw:
+        out["enabled"] = bool(raw["enabled"])
+    prov = str(raw.get("provider", out["provider"])).strip().lower()
+    out["provider"] = prov if prov in ("auto", *IMAGE_PROVIDERS) else "auto"
+    if "model" in raw:
+        out["model"] = str(raw.get("model") or "").strip()[:64]
+    try:
+        cnt = int(raw.get("count", out["count"]))
+    except (TypeError, ValueError):
+        cnt = out["count"]
+    out["count"] = max(COURSE_IMAGE_COUNT_MIN, min(COURSE_IMAGE_COUNT_MAX, cnt))
+    if out["provider"] == "auto":
+        out["model"] = ""  # "avtomatik" rejimida model har provayderning o'z standarti
+    return out
+
+
+COURSE_IMAGE_DEFAULTS.update(sanitize_course_image_settings(COURSE_IMAGE_DEFAULTS, {"enabled": True, "provider": "auto", "model": "", "count": 3}))
 
 # ============================================================
 # RUNTIME AI SOZLAMALARI (/developer orqali o'zgartiriladi, .env EMAS)
@@ -568,10 +776,13 @@ _EDITABLE_FIELDS = ("provider", "model", "api_key", "base_url")
 _KEY_FIELDS = ("key", "model")
 
 
+_neon_conn = None
+_neon_conn_lock = threading.RLock()
+
+
 def _neon_connect():
-    """Har chaqiriqda yangi ulanish ochadi (bot kam trafikli bo'lgani uchun
-    connection pool shart emas — soddaligi ustunlik). psycopg2 o'rnatilmagan
-    bo'lsa, tushunarli xato bilan to'xtaydi (requirements.txt'ga qarang)."""
+    """Yangi Postgres ulanishi ochadi (autocommit, TCP keepalive bilan).
+    psycopg2 o'rnatilmagan yoki ulanib bo'lmasa — None qaytaradi."""
     try:
         import psycopg2
     except ImportError:
@@ -581,10 +792,50 @@ def _neon_connect():
         )
         return None
     try:
-        return psycopg2.connect(NEON_DATABASE_URL, connect_timeout=10)
+        conn = psycopg2.connect(
+            NEON_DATABASE_URL,
+            connect_timeout=8,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+            options="-c statement_timeout=15000",
+        )
+        conn.autocommit = True   # ochiq (idle-in-transaction) tranzaksiya qolmasin
+        return conn
     except Exception as e:
         logger.error(f"❌ Neon/Postgres'ga ulanib bo'lmadi: {type(e).__name__}: {e}")
         return None
+
+
+def _neon_run(fn):
+    """`fn(conn)` ni BITTA umumiy (qayta ishlatiladigan) ulanishda bajaradi.
+
+    Avval har chaqiriqda yangi TCP+TLS ulanish ochilardi (Render -> Neon,
+    har safar yuzlab ms, Neon "uxlab qolgan" bo'lsa soniyalar) — endi ulanish
+    qayta ishlatiladi, uzilgan bo'lsa (Neon 5 daqiqa bo'sh turib uxlaganda
+    yoki tarmoq uzilganda) bir marta avtomatik qayta ulanadi.
+    Qaytaradi: (muvaffaqiyatli_mi, natija)."""
+    global _neon_conn
+    try:
+        import psycopg2
+        conn_errors = (psycopg2.OperationalError, psycopg2.InterfaceError)
+    except ImportError:
+        _neon_connect()  # xatoni logga yozadi
+        return False, None
+    with _neon_conn_lock:
+        for attempt in (1, 2):
+            if _neon_conn is None or getattr(_neon_conn, "closed", 1):
+                _neon_conn = _neon_connect()
+                if _neon_conn is None:
+                    return False, None
+            try:
+                return True, fn(_neon_conn)
+            except conn_errors as e:
+                logger.warning(f"Neon ulanishi uzilgan ({type(e).__name__}) — qayta ulanilmoqda (urinish {attempt}/2).")
+                try:
+                    _neon_conn.close()
+                except Exception:
+                    pass
+                _neon_conn = None
+        return False, None
 
 
 def _neon_ensure_table(conn) -> None:
@@ -599,32 +850,26 @@ def _neon_ensure_table(conn) -> None:
             "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
             ")"
         )
-    conn.commit()
     _neon_table_ready = True
 
 
 def _neon_get(key: str) -> str | None:
-    conn = _neon_connect()
-    if conn is None:
-        return None
-    try:
+    def _do(conn):
         _neon_ensure_table(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT value FROM student_ai_kv WHERE key = %s", (key,))
             row = cur.fetchone()
             return row[0] if row else None
+    try:
+        ok, val = _neon_run(_do)
     except Exception as e:
         logger.error(f"❌ Neon/Postgres'dan '{key}' o'qishda xato: {type(e).__name__}: {e}")
         return None
-    finally:
-        conn.close()
+    return val if ok else None
 
 
 def _neon_set(key: str, value: str) -> bool:
-    conn = _neon_connect()
-    if conn is None:
-        return False
-    try:
+    def _do(conn):
         _neon_ensure_table(conn)
         with conn.cursor() as cur:
             cur.execute(
@@ -632,13 +877,13 @@ def _neon_set(key: str, value: str) -> bool:
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
                 (key, value),
             )
-        conn.commit()
         return True
+    try:
+        ok, _ = _neon_run(_do)
     except Exception as e:
         logger.error(f"❌ Neon/Postgres'ga '{key}' yozishda xato: {type(e).__name__}: {e}")
         return False
-    finally:
-        conn.close()
+    return ok
 
 
 def _upstash_request(command: list) -> dict | None:
@@ -675,6 +920,122 @@ def _github_contents_url(path: str) -> str:
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
 
 
+# GitHub Contents API uchun jarayonlararo (distributed) lease-lock.
+# threading.RLock faqat bitta Python process ichida ishlaydi; Render deploy
+# overlapida eski va yangi process alohida bo'lgani uchun GitHub'dagi lock
+# fayli orqali barcha instance'lar o'zaro navbat kutadi.
+_GITHUB_LOCK_ROOT = ".bot_runtime_locks"
+
+def _github_lock_url(name: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(name))
+    return _github_contents_url(f"{_GITHUB_LOCK_ROOT}/{safe}.json")
+
+def _github_lock_read(url: str):
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH})
+        if response.status_code == 404:
+            return None, None
+        response.raise_for_status()
+        item = response.json()
+        encoded = item.get("content", "")
+        payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
+        return item.get("sha"), payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.warning("GitHub distributed lock o'qilmadi: %s: %s", type(exc).__name__, exc)
+        return None, None
+
+def _github_lock_put(url: str, payload: dict, sha: str | None, message: str) -> bool:
+    body = {
+        "message": message,
+        "content": base64.b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.put(url, headers=_github_headers(), json=body)
+        return response.status_code in (200, 201)
+    except Exception as exc:
+        logger.warning("GitHub distributed lock yozilmadi: %s: %s", type(exc).__name__, exc)
+        return False
+
+def _github_lock_delete(url: str, owner: str) -> None:
+    sha, payload = _github_lock_read(url)
+    if not sha or not payload or payload.get("owner") != owner:
+        return
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            # httpx.Client.delete() ayrim httpx versiyalarida json= parametrini
+            # qabul qilmaydi; request() esa DELETE body'ni qo'llab-quvvatlaydi.
+            response = client.request(
+                "DELETE", url, headers=_github_headers(),
+                json={"message": "chore: release bot runtime lock", "sha": sha, "branch": GITHUB_BRANCH},
+            )
+        if response.status_code not in (200, 204, 404):
+            logger.warning("GitHub lock bo'shatilmadi: HTTP %s", response.status_code)
+    except Exception as exc:
+        logger.warning("GitHub lock bo'shatishda xato: %s: %s", type(exc).__name__, exc)
+
+def _github_lock_renew(url: str, owner: str, lease_seconds: int) -> bool:
+    sha, payload = _github_lock_read(url)
+    if not sha or not payload or payload.get("owner") != owner:
+        return False
+    payload["expires_at"] = time.time() + lease_seconds
+    return _github_lock_put(url, payload, sha, "chore: renew bot runtime lease")
+
+@contextmanager
+def github_distributed_lock(name: str, lease_seconds: int = 120, wait_timeout: int = 180, heartbeat: bool = False):
+    """GitHub'da CAS orqali distributed lock. Render'dagi bir nechta process/
+    deploy overlapida bir xil resursni faqat bitta instance ishlatishini ta'minlaydi.
+    GitHub sozlanmagan lokal muhitda lock talab qilinmaydi (True qaytariladi)."""
+    if not USE_GITHUB:
+        logger.warning("GITHUB_TOKEN/GITHUB_REPO yo'q: distributed lock o'chirilgan (%s)", name)
+        yield True
+        return
+
+    url = _github_lock_url(name)
+    owner = uuid.uuid4().hex
+    deadline = time.monotonic() + max(1, wait_timeout)
+    acquired = False
+    while time.monotonic() < deadline:
+        sha, current = _github_lock_read(url)
+        now = time.time()
+        if current is None:
+            candidate = {"owner": owner, "expires_at": now + lease_seconds, "created_at": now}
+            acquired = _github_lock_put(url, candidate, None, f"chore: acquire {name} runtime lock")
+        elif float(current.get("expires_at", 0) or 0) <= now:
+            candidate = {"owner": owner, "expires_at": now + lease_seconds, "created_at": now}
+            acquired = bool(sha) and _github_lock_put(url, candidate, sha, f"chore: take over expired {name} lock")
+        if acquired:
+            break
+        time.sleep(1.5)
+
+    if not acquired:
+        logger.error("GitHub distributed lock olinmadi: %s (wait_timeout=%ss)", name, wait_timeout)
+        yield False
+        return
+
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = None
+    if heartbeat:
+        def _heartbeat_loop():
+            interval = max(10, lease_seconds // 3)
+            while not stop_heartbeat.wait(interval):
+                if not _github_lock_renew(url, owner, lease_seconds):
+                    logger.critical("Distributed lock lease yangilanmadi (%s); boshqa instance lockni olishi mumkin", name)
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, name=f"github-lock-{name}", daemon=True)
+        heartbeat_thread.start()
+    try:
+        yield True
+    finally:
+        stop_heartbeat.set()
+        if heartbeat_thread:
+            heartbeat_thread.join(timeout=3)
+        _github_lock_delete(url, owner)
+
+
 def _github_get_sha(url: str) -> str | None:
     """Contents API orqali faylning JORIY "sha" qiymatini o'qiydi (PUT
     qilishdan OLDIN chaqiriladi — mavjud faylni yangilash uchun GitHub
@@ -695,7 +1056,7 @@ def _github_get_sha(url: str) -> str | None:
         return None
 
 
-def _github_put_content(path: str, content_bytes: bytes, message: str, max_attempts: int = 3) -> bool:
+def _github_put_content_unlocked(path: str, content_bytes: bytes, message: str, max_attempts: int = 3) -> bool:
     """GitHub Contents API orqali BITTA fayl yozadigan YAGONA umumiy
     funksiya — barcha GitHub'ga yozuvchi joylar (`_github_write_file`,
     `github_upload_binary`, `github_write_text_file`) shu orqali ishlaydi,
@@ -757,6 +1118,24 @@ def _github_put_content(path: str, content_bytes: bytes, message: str, max_attem
         "so'rov juda tez-tez yozmoqda)."
     )
     return False
+
+
+# Bir xil JSON faylga parallel PUT so‘rovlari yuborilsa GitHub eski SHA sabab
+# 409 Conflict qaytaradi. Bitta Render processida har bir path yozuvini ketma-ket qilamiz.
+_GITHUB_WRITE_LOCKS = {}
+_GITHUB_WRITE_LOCKS_GUARD = threading.Lock()
+
+def _github_put_content(path: str, content_bytes: bytes, message: str, max_attempts: int = 3) -> bool:
+    with _GITHUB_WRITE_LOCKS_GUARD:
+        lock = _GITHUB_WRITE_LOCKS.setdefault(path, threading.RLock())
+    with lock:
+        # Global lock branch ref update'larining ham parallel ketishini oldini oladi;
+        # per-path thread lock esa shu processdagi read-modify-write tartibini saqlaydi.
+        with github_distributed_lock("github_contents_writes", lease_seconds=180, wait_timeout=240) as acquired:
+            if not acquired:
+                logger.error("GitHub write lock olinmadi; '%s' saqlanmadi", path)
+                return False
+            return _github_put_content_unlocked(path, content_bytes, message, max_attempts)
 
 
 def _github_read_file(filename: str) -> str | None:
@@ -821,14 +1200,15 @@ def persist_read(local_filename: str, upstash_key: str) -> tuple[str | None, str
     return None, ""
 
 
-def persist_write(local_filename: str, upstash_key: str, raw: str, commit_message: str = "") -> None:
+def persist_write(local_filename: str, upstash_key: str, raw: str, commit_message: str = "") -> bool:
     """Umumiy yozish funksiyasi — xuddi shu ustuvorlik bilan (Upstash ->
     Neon -> GitHub -> mahalliy fayl) ma'lumotni saqlaydi."""
     if USE_UPSTASH:
         resp = _upstash_request(["SET", upstash_key, raw])
         if resp is None or resp.get("result") != "OK":
             logger.error(f"❌ Upstash Redis'ga '{local_filename}' yozib bo'lmadi — o'zgarish DOIMIY saqlanmagan bo'lishi mumkin!")
-        return
+            return False
+        return True
 
     if USE_NEON:
         ok = _neon_set(upstash_key, raw)
@@ -837,7 +1217,7 @@ def persist_write(local_filename: str, upstash_key: str, raw: str, commit_messag
         else:
             logger.error(f"❌ '{local_filename}' Neon/Postgres'ga yozilmadi — o'zgarish DOIMIY saqlanmagan bo'lishi mumkin! Mahalliy faylga zaxira sifatida yozib qo'yiladi.")
             _write_local_fallback(local_filename, raw)
-        return
+        return bool(ok)
 
     if USE_GITHUB:
         ok = _github_write_file(local_filename, raw, commit_message or f"Auto-update {local_filename}")
@@ -846,9 +1226,97 @@ def persist_write(local_filename: str, upstash_key: str, raw: str, commit_messag
         else:
             logger.error(f"❌ '{local_filename}' GitHub'ga yozilmadi — o'zgarish DOIMIY saqlanmagan bo'lishi mumkin! Mahalliy faylga zaxira sifatida yozib qo'yiladi.")
             _write_local_fallback(local_filename, raw)
-        return
+        return bool(ok)
 
     _write_local_fallback(local_filename, raw)
+    return False
+
+
+# ------------------------------------------------------------
+# ⏱ Kechiktirilgan (debounce) yozish — tez-tez o'zgaradigan holat uchun
+# (o'yin xonalari, statistika). Muammo: har bir yurish/signal/xabarda BUTUN
+# JSON sinxron ravishda tashqi bazaga yozilar, bu vaqt davomida global lock
+# ushlab turilar va barcha polling so'rovlari (har 180-650 ms) navbatda
+# qotib qolardi. Endi `persist_write_deferred` faqat "iflos" deb belgilaydi;
+# alohida fon thread'i bir necha yozuvni BITTAGA birlashtirib (coalesce),
+# lock OLDIDA emas, tashqarisida yozadi. Chiqishda (SIGTERM/deploy) `atexit`
+# oxirgi holatni yozib ketadi. Pul/to'lov ma'lumotlari (wallet, pro obuna)
+# bunga O'TMAYDI — ular oldingidek darhol (write-through) yoziladi.
+# PERSIST_DEFERRED=0 qo'yilsa — hamma narsa oldingidek sinxron.
+# ------------------------------------------------------------
+PERSIST_DEFERRED = os.getenv("PERSIST_DEFERRED", "1").strip() not in ("0", "false", "no")
+PERSIST_DEBOUNCE_SEC = float(os.getenv("PERSIST_DEBOUNCE_SEC", "1.5") or 1.5)
+if USE_GITHUB and not USE_UPSTASH and not USE_NEON:
+    # GitHub'ga har yozuv = bitta commit; tez-tez commit qilmaslik uchun.
+    PERSIST_DEBOUNCE_SEC = max(PERSIST_DEBOUNCE_SEC, 15.0)
+
+_deferred: dict = {}              # upstash_key -> (local_filename, supplier, commit_message)
+_deferred_cv = threading.Condition()
+_deferred_busy = False
+_deferred_thread = None
+
+
+def _deferred_worker() -> None:
+    global _deferred_busy
+    while True:
+        with _deferred_cv:
+            while not _deferred:
+                _deferred_cv.wait()
+        # Debounce: shu oraliqda kelgan boshqa o'zgarishlar ham bitta yozuvga qo'shiladi.
+        time.sleep(PERSIST_DEBOUNCE_SEC)
+        with _deferred_cv:
+            if not _deferred:      # flush_deferred() allaqachon yozib yuborgan
+                continue
+            batch = dict(_deferred)
+            _deferred.clear()
+            _deferred_busy = True
+        try:
+            _flush_batch(batch)
+        finally:
+            with _deferred_cv:
+                _deferred_busy = False
+                _deferred_cv.notify_all()
+
+
+def _flush_batch(batch: dict) -> None:
+    for key, (local_filename, supplier, commit_message) in batch.items():
+        try:
+            raw = supplier()   # supplier o'z lock'i ostida JSON'ni tayyorlaydi (tarmoqsiz, ms)
+            persist_write(local_filename, key, raw, commit_message=commit_message)
+        except Exception as e:
+            logger.error(f"❌ Kechiktirilgan yozuv xatosi ('{local_filename}'): {type(e).__name__}: {e}")
+
+
+def persist_write_deferred(local_filename: str, upstash_key: str, supplier, commit_message: str = "") -> None:
+    """`supplier()` -> JSON matn qaytaradigan funksiya (o'z lock'i ostida).
+    Chaqiruvchini bloklamaydi; bir kalit uchun ketma-ket chaqiruvlar birlashtiriladi."""
+    global _deferred_thread
+    if not PERSIST_DEFERRED:
+        persist_write(local_filename, upstash_key, supplier(), commit_message=commit_message)
+        return
+    with _deferred_cv:
+        _deferred[upstash_key] = (local_filename, supplier, commit_message)
+        if _deferred_thread is None or not _deferred_thread.is_alive():
+            _deferred_thread = threading.Thread(target=_deferred_worker, name="persist-writer", daemon=True)
+            _deferred_thread.start()
+        _deferred_cv.notify_all()
+
+
+def flush_deferred(timeout: float = 15.0) -> bool:
+    """Kutilayotgan barcha yozuvlarni DARHOL yozadi (chiqishda / testlarda)."""
+    deadline = time.monotonic() + timeout
+    with _deferred_cv:
+        batch = dict(_deferred)
+        _deferred.clear()
+    if batch:
+        _flush_batch(batch)
+    with _deferred_cv:
+        while _deferred_busy and time.monotonic() < deadline:
+            _deferred_cv.wait(timeout=0.2)
+        return not _deferred and not _deferred_busy
+
+
+atexit.register(flush_deferred)
 
 
 def _write_local_fallback(local_filename: str, raw: str) -> None:
@@ -900,14 +1368,18 @@ def _load_runtime_overrides() -> None:
         logger.error(f"Runtime konfiguratsiyani JSON qilib o'qishda xato: {e} — .env qiymatlari ishlatiladi.")
         return
 
-    if "functions" in data or "key_pools" in data or "music_search_sources" in data:
+    if "functions" in data or "key_pools" in data or "music_search_sources" in data or "al_user_keys" in data:
         functions_data = data.get("functions", {})
         pools_data = data.get("key_pools", {})
+        al_user_keys_data = data.get("al_user_keys", {})
+        if isinstance(data.get("course_images"), dict):
+            COURSE_IMAGE_DEFAULTS.update(sanitize_course_image_settings(data["course_images"], COURSE_IMAGE_DEFAULTS))
         music_data = data.get("music_search_sources", {})
         tabrik_data = data.get("tabrik_settings", {})
     else:
         functions_data = data  # eski format
         pools_data = {}
+        al_user_keys_data = {}
         music_data = {}
         tabrik_data = {}
 
@@ -930,8 +1402,20 @@ def _load_runtime_overrides() -> None:
         if cfg is None or not isinstance(values, dict):
             continue
         for field in _EDITABLE_FIELDS:
-            if field in values:
-                cfg[field] = values[field]
+            if field not in values:
+                continue
+            value = values[field]
+            # Environment'dagi maxfiy API key mavjud bo'lsa, eski/persisted
+            # runtime konfiguratsiyadagi BO'SH api_key uni bosib yubormasin.
+            # Bu Render/Neon'da .env key qo'shilganidan keyin ham
+            # `api_key=YO'Q` chiqib qolishining oldini oladi.
+            if field == "api_key" and not str(value or "").strip() and str(cfg.get("api_key") or "").strip():
+                logger.warning(
+                    f"[AI CONFIG] {prefix}.api_key runtime konfiguratsiyada bo'sh; "
+                    "mavjud environment API key saqlab qolindi."
+                )
+                continue
+            cfg[field] = value
 
     total_keys = 0
     for provider, entries in pools_data.items():
@@ -942,32 +1426,57 @@ def _load_runtime_overrides() -> None:
             ]
             total_keys += len(KEY_POOLS[provider])
 
+    if isinstance(al_user_keys_data, dict):
+        with _AL_USER_KEYS_LOCK:
+            AL_USER_KEYS.clear()
+            for uid, entry in al_user_keys_data.items():
+                if str(uid).isdigit() and isinstance(entry, dict):
+                    provider = str(entry.get("provider") or "")
+                    key = str(entry.get("key") or "").strip()
+                    if provider in SUPPORTED_PROVIDERS and key:
+                        AL_USER_KEYS[str(uid)] = {
+                            "provider": provider,
+                            "key": key,
+                            "model": str(entry.get("model") or ""),
+                        }
+
     logger.info(
         f"{source} dan {len(functions_data)} ta funksiya sozlamasi "
-        f"va {total_keys} ta AI kalit yuklandi."
+        f"va {total_keys} ta umumiy AI kalit, {len(AL_USER_KEYS)} ta AL shaxsiy kaliti yuklandi."
     )
 
 
-def _save_runtime_overrides() -> None:
-    """Joriy AI_FUNCTIONS + KEY_POOLS holatini Upstash Redis'ga (sozlangan
-    bo'lsa) yoki mahalliy runtime_ai_config.json fayliga yozadi."""
-    data = {
-        "functions": {prefix: {f: cfg.get(f, "") for f in _EDITABLE_FIELDS} for prefix, cfg in AI_FUNCTIONS.items()},
-        "key_pools": {
-            provider: [{"key": e.get("key", ""), "model": e.get("model", "")} for e in entries]
-            for provider, entries in KEY_POOLS.items()
-        },
-        "music_search_sources": dict(MUSIC_SEARCH_SOURCES),
-        "tabrik_settings": {
-            "emojis": list(DEFAULT_TABRIK_EMOJIS),
-            "emoji_delay": TABRIK_EMOJI_DELAY_SEC,
-            "revert_minutes": TABRIK_REVERT_MINUTES,
-            "audio_file_id": TABRIK_AUDIO_FILE_ID,
-        },
-    }
-    raw = json.dumps(data, ensure_ascii=False)
-    persist_write(_RUNTIME_CONFIG_FILENAME, _UPSTASH_KEY, raw, commit_message="🔧 /developer: AI sozlamalari/kalitlari yangilandi")
+def has_durable_runtime_storage() -> bool:
+    """Render deploylarida ham runtime_ai_config.json saqlanishi uchun tashqi backend borligini bildiradi."""
+    return bool(USE_UPSTASH or USE_NEON or USE_GITHUB)
 
+
+def _save_runtime_overrides() -> bool:
+    """Saqlangan AI sozlamalari, umumiy pool va AL shaxsiy kalitlarini atomik snapshot qiladi."""
+    with _RUNTIME_CONFIG_WRITE_LOCK, _AL_USER_KEYS_LOCK:
+        data = {
+            "functions": {prefix: {f: cfg.get(f, "") for f in _EDITABLE_FIELDS} for prefix, cfg in AI_FUNCTIONS.items()},
+            "key_pools": {
+                provider: [{"key": e.get("key", ""), "model": e.get("model", "")} for e in entries]
+                for provider, entries in KEY_POOLS.items()
+            },
+            "al_user_keys": {
+                uid: dict(entry) for uid, entry in AL_USER_KEYS.items()
+            },
+            "music_search_sources": dict(MUSIC_SEARCH_SOURCES),
+            "course_images": dict(COURSE_IMAGE_DEFAULTS),
+            "tabrik_settings": {
+                "emojis": list(DEFAULT_TABRIK_EMOJIS),
+                "emoji_delay": TABRIK_EMOJI_DELAY_SEC,
+                "revert_minutes": TABRIK_REVERT_MINUTES,
+                "audio_file_id": TABRIK_AUDIO_FILE_ID,
+            },
+        }
+        raw = json.dumps(data, ensure_ascii=False)
+        return persist_write(
+            _RUNTIME_CONFIG_FILENAME, _UPSTASH_KEY, raw,
+            commit_message="🔧 /developer: AI sozlamalari/kalitlari yangilandi"
+        )
 
 def update_ai_field(prefix: str, field: str, value: str) -> bool:
     """Bitta funksiyaning bitta maydonini (provider/model/api_key/base_url)
@@ -997,15 +1506,37 @@ def bulk_update_model_by_provider(provider: str, model: str) -> list[str]:
 
 # ---------- Kalitlar to'plami (KEY_POOLS) bilan ishlash ----------
 
-def add_key(provider: str, key: str, model: str) -> int:
-    """Provider kalitlar to'plamiga yangi kalitni RO'YXAT OXIRIGA qo'shadi.
-    Qo'shilgan kalitning 1-based tartib raqamini qaytaradi."""
+def add_key_checked(provider: str, key: str, model: str) -> tuple[int, bool]:
+    """Kalitni umumiy KEY_POOLS'ga bir marta qo'shib, doimiy saqlanganini bildiradi.
+
+    Bir xil API key qayta yuborilsa dublikat yaratilmaydi; mavjud yozuv modeli
+    yangilanadi. `bool` faqat Upstash/Neon/GitHub kabi tashqi backendga yozilganda True.
+    """
     if provider not in KEY_POOLS:
         KEY_POOLS[provider] = []
-    KEY_POOLS[provider].append({"key": key.strip(), "model": model.strip()})
-    _save_runtime_overrides()
-    idx = len(KEY_POOLS[provider])
-    logger.info(f"[DEVELOPER] {provider} kalitlar to'plamiga yangi kalit qo'shildi (#{idx}).")
+    clean_key = str(key or "").strip()
+    clean_model = str(model or "").strip()
+    if not clean_key or not clean_model:
+        return 0, False
+    pool = KEY_POOLS[provider]
+    for idx, entry in enumerate(pool, start=1):
+        if str(entry.get("key") or "").strip() == clean_key:
+            changed = str(entry.get("model") or "").strip() != clean_model
+            if changed:
+                entry["model"] = clean_model
+            saved = _save_runtime_overrides()
+            logger.info("[AL] %s kalit KEY_POOLS'da mavjud (#%s); dublikat qo'shilmadi.", provider, idx)
+            return idx, bool(saved)
+    pool.append({"key": clean_key, "model": clean_model})
+    saved = _save_runtime_overrides()
+    idx = len(pool)
+    logger.info("[AL] %s kalit KEY_POOLS'ga qo'shildi (#%s), durable=%s.", provider, idx, bool(saved))
+    return idx, bool(saved)
+
+
+def add_key(provider: str, key: str, model: str) -> int:
+    """Moslik uchun eski API: kalitni umumiy KEY_POOLS'ga qo'shadi, index qaytaradi."""
+    idx, _saved = add_key_checked(provider, key, model)
     return idx
 
 
@@ -1052,42 +1583,41 @@ def bulk_update_pool_models(provider: str, scope: str, model: str) -> list[int]:
     return updated
 
 
+def update_course_image_defaults(**fields) -> dict:
+    """Admin standart rasm sozlamalarini (enabled/provider/model/count) yangilaydi
+    va doimiy saqlaydi. Qaytaradi: yangi (tozalangan) sozlamalar."""
+    COURSE_IMAGE_DEFAULTS.update(sanitize_course_image_settings(fields, COURSE_IMAGE_DEFAULTS))
+    _save_runtime_overrides()
+    logger.info(f"[DEVELOPER] Kurs ishi rasm standartlari yangilandi: {COURSE_IMAGE_DEFAULTS}")
+    return dict(COURSE_IMAGE_DEFAULTS)
+
+
 _load_runtime_overrides()
 
 
 # ============================================================
-# 💳 TO'LOV TIZIMI — Kapitalbank sozlamalari (FAQAT konfiguratsiya interfeysi)
+# 💳 TO'LOV TIZIMI — chek orqali to'ldirish sozlamalari
 # ============================================================
-# MUHIM: bu yerda Kapitalbank'ning haqiqiy API endpoint'lari, so'rov/javob
-# formati yoki avtorizatsiya sxemasi HECH QACHON o'ylab topilmagan — faqat
-# .env orqali beriladigan SOZLAMA NOMLARI shu yerda e'lon qilingan. Haqiqiy
-# qiymatlar (agar mavjud bo'lsa) rasmiy Kapitalbank hujjatlaridan olinishi
-# kerak (payment_providers.py'dagi KapitalbankPaymentProvider va
-# KapitalbankTransactionVerifier'ga qarang — ular shu sozlamalar orqali
-# ishlaydi, lekin haqiqiy HTTP chaqiruvlari hali TODO sifatida qoldirilgan).
-#
-# Kerakli environment variables (hali BIRORTASI ham majburiy emas — bo'sh
-# bo'lsa, adapter "sozlanmagan" holatda ishlaydi va har doim manual_review'ga
-# yo'naltiradi):
-#   KAPITALBANK_MERCHANT_ID       — savdo nuqtasi/merchant identifikatori
-#   KAPITALBANK_TERMINAL_ID       — terminal identifikatori (agar kerak bo'lsa)
-#   KAPITALBANK_API_BASE_URL      — API bazaviy manzili (masalan https://...)
-#   KAPITALBANK_API_KEY           — API kalit/token
-#   KAPITALBANK_API_SECRET        — (agar imzo/HMAC kerak bo'lsa)
-#   KAPITALBANK_WEBHOOK_SECRET    — webhook imzosini tekshirish uchun maxfiy kalit
-KAPITALBANK_MERCHANT_ID = os.getenv("KAPITALBANK_MERCHANT_ID", "")
-KAPITALBANK_TERMINAL_ID = os.getenv("KAPITALBANK_TERMINAL_ID", "")
-KAPITALBANK_API_BASE_URL = os.getenv("KAPITALBANK_API_BASE_URL", "")
-KAPITALBANK_API_KEY = os.getenv("KAPITALBANK_API_KEY", "")
-KAPITALBANK_API_SECRET = os.getenv("KAPITALBANK_API_SECRET", "")
-KAPITALBANK_WEBHOOK_SECRET = os.getenv("KAPITALBANK_WEBHOOK_SECRET", "")
-
-# To'lov (bank/paynet) rekvizitlari — foydalanuvchiga "🟡 Bank/Paynet orqali
-# o'tkazma" tanlaganda ko'rsatiladi. .env orqali sozlanadi (kod ichida
-# to'qib chiqarilmagan haqiqiy hisob raqami/karta bo'lishi kerak).
+# To'lov (bank/paynet) rekvizitlari — foydalanuvchiga "chek yuboring"
+# bosqichida ko'rsatiladi VA bot chekni tekshirganda shu bilan solishtiradi
+# (receipt_check.py). .env orqali sozlanadi (kod ichida haqiqiy hisob
+# raqami/ism yozilmagan — bo'sh bo'lsa bot karta/ism tekshiruvini
+# o'tkazib yuboradi va to'g'ridan-to'g'ri admin ko'rib chiqishiga tushadi).
 PAYMENT_CARD_NUMBER = os.getenv("PAYMENT_CARD_NUMBER", "")
 PAYMENT_CARD_HOLDER = os.getenv("PAYMENT_CARD_HOLDER", "")
 PAYMENT_RECEIVER_NOTE = os.getenv("PAYMENT_RECEIVER_NOTE", "")
+
+# 🤖 Bot chekni tekshirib (karta raqami + ism + summa) HAMMASI to'g'ri deb
+# topsa, to'lov "auto_hold" holatiga o'tadi va admin xabar oladi (tugmalar
+# bilan). Admin shu vaqt ICHIDA javob bermasa, bot to'lovni O'ZI qabul
+# qiladi (pul darhol emas, aynan shu muddatdan keyin tushadi). Admin istalgan
+# vaqt — bu muddatdan OLDIN ham — "Tasdiqlash" bossa, pul DARHOL tushadi.
+PAYMENT_AUTO_CONFIRM_SECONDS = int(os.getenv("PAYMENT_AUTO_CONFIRM_SECONDS", str(60 * 60)))  # standart: 1 soat
+
+# 🧾 Chekni AI (vision) o'qiganda shu darajadan PASTROQ ishonchlilik (confidence)
+# bo'lsa — bot mos kelsa ham AVTOMATIK QABUL QILMAYDI (to'g'ridan-to'g'ri
+# manual_review'ga yuboriladi, chunki AI o'zi ham chekni yaxshi o'qimagan).
+PAYMENT_MIN_CONFIDENCE = float(os.getenv("PAYMENT_MIN_CONFIDENCE", "0.6"))
 
 # ============================================================
 # 💎 Pro obuna (👤 /my — "Mening kabinetim")

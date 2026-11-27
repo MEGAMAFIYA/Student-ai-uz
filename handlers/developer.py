@@ -34,12 +34,16 @@ import sys
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 
+import time
 import github_dev
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
 import ai_clients
+import image_clients
 import render_api
+import render_env_pdf
+import render_keepalive
 import config
 import pro_subscription
 import storage
@@ -49,7 +53,7 @@ from handlers import payment_admin as pay_ui
 
 logger = logging.getLogger(__name__)
 
-DEV_MENU, DEV_WAIT_TEXT, DEV_WAIT_BULK_MODEL, DEV_WAIT_AUDIO, DEV_WAIT_GITHUB = range(5)
+DEV_MENU, DEV_WAIT_TEXT, DEV_WAIT_BULK_MODEL, DEV_WAIT_AUDIO, DEV_WAIT_GITHUB, DEV_WAIT_ENVPDF = range(6)
 
 _FIELD_LABELS = {
     "provider": "PROVIDER",
@@ -60,13 +64,22 @@ _FIELD_LABELS = {
 
 _SCOPE_LABELS = {"all": "barcha", "odd": "toq sondagi", "even": "juft sondagi"}
 
-_STATUS_ICONS = {"ok": "✅", "quota": "⏳", "paid": "🚫", "invalid": "❌", "error": "⚠️"}
+_STATUS_ICONS = {
+    "ok": "✅", "quota": "⏳", "paid": "🚫", "invalid": "❌", "error": "⚠️",
+    "no_balance": "💸", "model_not_found": "🔎", "bad_request": "⚠️",
+    "moderated": "🛑", "timeout": "⌛️",
+}
 _STATUS_TEXT = {
     "ok": "ishlayapti",
     "quota": "limit tugagan",
     "paid": "model pullik",
     "invalid": "kalit yaroqsiz",
     "error": "xato",
+    "no_balance": "balans tugagan",
+    "model_not_found": "model topilmadi",
+    "bad_request": "so'rov noto'g'ri",
+    "moderated": "moderatsiya blokladi",
+    "timeout": "vaqt tugadi",
 }
 
 
@@ -271,7 +284,8 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📝 Testlar bazasi", callback_data="dev:managed_tests")],
         [InlineKeyboardButton("☁️ RENDER", callback_data="dev:render"),
          InlineKeyboardButton("☁️ GitHub", callback_data="dev:github")],
-        [InlineKeyboardButton("🔍 Inline jurnali", callback_data="dev:inlinelog:all")],
+        [InlineKeyboardButton("🔍 Inline jurnali", callback_data="dev:inlinelog:all"),
+         InlineKeyboardButton("📢 Reklama", callback_data="dev:ads")],
         [InlineKeyboardButton("❌ Yopish", callback_data="dev:close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -300,6 +314,7 @@ def _kalitlar_menu_keyboard() -> InlineKeyboardMarkup:
     rows += [
         [InlineKeyboardButton("🔑 AI kalitlari", callback_data="dev:keys"),
          InlineKeyboardButton("➕ Barcha modellar", callback_data="dev:bulk")],
+        [InlineKeyboardButton("🖼 Kurs ishi rasmlari", callback_data="dev:cwimg")],
         [InlineKeyboardButton("⬅️ Orqaga", callback_data="dev:menu")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -314,6 +329,8 @@ def _moliya_menu_text() -> str:
 
 def _moliya_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Sovg'a", callback_data="dev:gift"),
+         InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="dev:users:0")],
         [InlineKeyboardButton("💎 Pro obunalar", callback_data="dev:prosub")],
         [InlineKeyboardButton("💳 To'lovlar", callback_data="dev:pay")],
         [InlineKeyboardButton("💰 Balanslar", callback_data="dev:paybal")],
@@ -528,8 +545,22 @@ def _provider_choice_keyboard(back_callback: str, choose_prefix: str) -> InlineK
 # ============================================================
 
 def _keys_menu_text() -> str:
-    lines = ["🔑 <b>AI kalitlari</b>\n"]
-    for provider in config.SUPPORTED_PROVIDERS:
+    lines = [
+        "🔑 <b>AI kalitlari</b>\n",
+        "ℹ️ Bu yerdagi provider kalitlari faqat bot funksiyalari uchun. AL YORDAMCHI ulardan foydalanmaydi.\n"
+        "🤖 AL YORDAMCHI kalitlari alohida saqlanadi va egasining Telegram ID raqamiga bog‘langan:\n",
+    ]
+    al_entries = getattr(config, "AL_USER_KEYS", {})
+    if al_entries:
+        for owner_id, entry in sorted(al_entries.items(), key=lambda item: str(item[0])):
+            masked = _esc(_mask_key(entry.get("key", "")))
+            provider_label = _esc(_provider_label(entry.get("provider", "")))
+            model = _esc(entry.get("model") or "model tanlanmagan")
+            lines.append(f"  • Egasi <code>{_esc(owner_id)}</code> — {provider_label}: <code>{masked}</code> — <code>{model}</code>")
+    else:
+        lines.append("  <i>(hali AL Yordamchi uchun shaxsiy kalit kiritilmagan)</i>")
+    lines.append("")
+    for provider in config.ALL_KEY_PROVIDERS:
         pool = config.KEY_POOLS.get(provider, [])
         lines.append(f"<b>{_esc(_provider_label(provider))} kalitlar:</b>")
         if not pool:
@@ -546,7 +577,7 @@ def _keys_menu_text() -> str:
 
 def _keys_menu_keyboard() -> InlineKeyboardMarkup:
     rows = []
-    for provider in config.SUPPORTED_PROVIDERS:
+    for provider in config.ALL_KEY_PROVIDERS:
         pool = config.KEY_POOLS.get(provider, [])
         btns = [
             InlineKeyboardButton(f"{_provider_label(provider)} {i}", callback_data=f"dev:keyview:{provider}:{i}")
@@ -566,26 +597,113 @@ def _key_view_text(provider: str, index: int) -> str:
     if not (1 <= index <= len(pool)):
         return "⚠️ Bu kalit topilmadi (o'chirilgan bo'lishi mumkin)."
     entry = pool[index - 1]
+    model = entry.get("model") or "—"
+    extra = ""
+    if provider in config.IMAGE_PROVIDERS:
+        extra = f" ({_esc(image_clients.model_label(provider, model))})\n🎨 <i>Rasm yaratish provayderi</i>"
     return (
         f"🔑 <b>{_esc(_provider_label(provider))} — Kalit #{index}</b>\n\n"
         f"Kalit: <code>{_esc(_mask_key(entry.get('key', '')))}</code>\n"
-        f"Model: <code>{_esc(entry.get('model') or '—')}</code>"
+        f"Model: <code>{_esc(model)}</code>{extra}"
     )
 
 
 def _key_view_keyboard(provider: str, index: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🔁 Kalitni almashtirish", callback_data=f"dev:keyrepl:{provider}:{index}")],
         [InlineKeyboardButton("✏️ Modelni o'zgartirish", callback_data=f"dev:keymodel:{provider}:{index}")],
+        [InlineKeyboardButton("🩺 Shu kalitni tekshirish", callback_data=f"dev:keycheck1:{provider}:{index}")],
+    ]
+    if provider in config.IMAGE_PROVIDERS:
+        rows.append([InlineKeyboardButton("🧪 Test rasm yaratish (pullik)", callback_data=f"dev:keyimgtest:{provider}:{index}")])
+    rows += [
         [InlineKeyboardButton("🗑 O'chirish", callback_data=f"dev:keydel:{provider}:{index}")],
         [InlineKeyboardButton("⬅️ Orqaga", callback_data="dev:keys")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------- 🎨 Rasm provayderlari: model tanlash (ro'yxatdan YOKI qo'lda) ----------
+
+def _img_model_picker_text(provider: str, intro: str) -> str:
+    lines = [intro, "", f"<b>{_esc(_provider_label(provider))} — mavjud modellar:</b>"]
+    for m in image_clients.models_for(provider):
+        price = f" — ~{m['credits']:g} kredit" if m.get("credits") is not None else ""
+        lines.append(f"• <code>{_esc(m['id'])}</code> ({_esc(m['label'])}){price}")
+    if provider == "bfl":
+        lines.append("\nℹ️ FLUX.1 [schnell] BFL rasmiy API'sida mavjud emas (faqat ochiq vaznlar). "
+                     "Narxlar: bfl.ai/pricing")
+    else:
+        lines.append("\nℹ️ Narxlar taxminiy (1 kredit = $0.01) va o'zgarishi mumkin.")
+    lines.append("\nRo'yxatdan tanlang yoki \"✍️ Qo'lda kiritish\" ni bosing.")
+    return "\n".join(lines)
+
+
+def _img_model_picker_keyboard(provider: str, pick_prefix: str, manual_cb: str, back_cb: str) -> InlineKeyboardMarkup:
+    rows = []
+    for i, m in enumerate(image_clients.models_for(provider)):
+        rows.append([InlineKeyboardButton(m["label"], callback_data=f"{pick_prefix}:{i}")])
+    rows.append([InlineKeyboardButton("✍️ Qo'lda kiritish", callback_data=manual_cb)])
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _img_model_by_index(provider: str, i: int) -> str:
+    models = image_clients.models_for(provider)
+    return models[i]["id"] if 0 <= i < len(models) else ""
+
+
+# ---------- 🖼 Kurs ishi rasmlari — administrator standart sozlamalari ----------
+
+def _cwimg_keys_summary() -> str:
+    parts = []
+    for p in config.IMAGE_PROVIDERS:
+        n = len([e for e in config.KEY_POOLS.get(p, []) if e.get("key")])
+        parts.append(f"{_esc(_provider_label(p))}: {n} ta kalit")
+    return " | ".join(parts)
+
+
+def _cwimg_menu_text() -> str:
+    d = config.COURSE_IMAGE_DEFAULTS
+    prov = "Avtomatik" if d["provider"] == "auto" else _provider_label(d["provider"])
+    if d["provider"] == "auto":
+        model = "har provayderning standart modeli"
+    else:
+        model = d["model"] or f"standart ({config.DEFAULT_MODEL_BY_PROVIDER.get(d['provider'], '—')})"
+    return (
+        "🖼 <b>Kurs ishi rasmlari — standart sozlamalar</b>\n\n"
+        "Foydalanuvchi kurs ishi yaratishda rasm sozlamasini tanlamasa, shular ishlaydi.\n\n"
+        f"Rasmlar: <b>{'✅ YOQILGAN' if d['enabled'] else '⛔️ O‘CHIRILGAN'}</b>\n"
+        f"Provayder: <b>{_esc(prov)}</b>\n"
+        f"Model: <code>{_esc(model)}</code>\n"
+        f"Rasm soni: <b>{d['count']}</b> (diagramma + AI illyustratsiya, 1–5)\n\n"
+        f"🔑 {_cwimg_keys_summary()}\n"
+        "ℹ️ Diagrammalar (blok-sxema, arxitektura, statistik diagramma) kalitsiz, "
+        "aniq ma'lumotdan chiziladi; AI generator faqat illyustratsiya uchun."
+    )
+
+
+def _cwimg_menu_keyboard() -> InlineKeyboardMarkup:
+    d = config.COURSE_IMAGE_DEFAULTS
+    def mark(cond, text):
+        return ("✅ " if cond else "") + text
+    rows = [
+        [InlineKeyboardButton("⛔️ O'chirish" if d["enabled"] else "✅ Yoqish", callback_data="dev:cwimgtoggle")],
+        [InlineKeyboardButton(mark(d["provider"] == "auto", "Avtomatik"), callback_data="dev:cwimgprov:auto"),
+         InlineKeyboardButton(mark(d["provider"] == "bfl", "BFL"), callback_data="dev:cwimgprov:bfl"),
+         InlineKeyboardButton(mark(d["provider"] == "stability", "Stability"), callback_data="dev:cwimgprov:stability")],
+    ]
+    if d["provider"] != "auto":
+        rows.append([InlineKeyboardButton("🧩 Modelni tanlash", callback_data="dev:cwimgmodelmenu")])
+    rows.append([InlineKeyboardButton(mark(d["count"] == n, str(n)), callback_data=f"dev:cwimgcount:{n}") for n in range(1, 6)])
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="dev:kalitlar")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _keyadd_text() -> str:
     links = "\n".join(
         f"🔹 {_esc(_provider_label(p))}: {_esc(config.PROVIDER_KEY_LINKS.get(p, ''))}"
-        for p in config.SUPPORTED_PROVIDERS
+        for p in config.ALL_KEY_PROVIDERS
     )
     return (
         "➕ <b>Yangi kalit qo'shish</b>\n\n"
@@ -596,14 +714,14 @@ def _keyadd_text() -> str:
 
 
 def _keyadd_keyboard() -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(_provider_label(p), callback_data=f"dev:keyaddprov:{p}") for p in config.SUPPORTED_PROVIDERS]
+    buttons = [InlineKeyboardButton(_provider_label(p), callback_data=f"dev:keyaddprov:{p}") for p in config.ALL_KEY_PROVIDERS]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="dev:keys")])
     return InlineKeyboardMarkup(rows)
 
 
 def _keybulk_keyboard() -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(_provider_label(p), callback_data=f"dev:keybulkprov:{p}") for p in config.SUPPORTED_PROVIDERS]
+    buttons = [InlineKeyboardButton(_provider_label(p), callback_data=f"dev:keybulkprov:{p}") for p in config.ALL_KEY_PROVIDERS]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="dev:keys")])
     return InlineKeyboardMarkup(rows)
@@ -787,7 +905,7 @@ async def _run_key_check() -> str:
     ishlamayotganini ko'rish mumkin."""
     logger.info("🩺 Kalitlarni tekshirish boshlandi (/developer > AI kalitlari > Tekshirish)...")
     tasks, meta = [], []
-    for provider in config.SUPPORTED_PROVIDERS:
+    for provider in config.ALL_KEY_PROVIDERS:
         for i, entry in enumerate(config.KEY_POOLS.get(provider, []), start=1):
             key, model = entry.get("key", ""), entry.get("model", "")
             if key and model:
@@ -799,7 +917,7 @@ async def _run_key_check() -> str:
     results = await asyncio.gather(*tasks) if tasks else []
     result_iter = iter(results)
 
-    by_provider: dict[str, list] = {p: [] for p in config.SUPPORTED_PROVIDERS}
+    by_provider: dict[str, list] = {p: [] for p in config.ALL_KEY_PROVIDERS}
     ok_count, fail_count = 0, 0
     for provider, i, model, has_data in meta:
         if has_data:
@@ -816,7 +934,7 @@ async def _run_key_check() -> str:
 
     lines = ["🩺 <b>Kalitlar holati</b>\n"]
     any_key = False
-    for provider in config.SUPPORTED_PROVIDERS:
+    for provider in config.ALL_KEY_PROVIDERS:
         items = by_provider[provider]
         lines.append(f"<b>{_esc(_provider_label(provider))}:</b>")
         if not items:
@@ -827,7 +945,7 @@ async def _run_key_check() -> str:
                 icon = _STATUS_ICONS.get(status, "⚠️")
                 text = _STATUS_TEXT.get(status, status)
                 line = f"  {i}. {icon} {text} (<code>{_esc(model)}</code>)"
-                if status != "ok" and detail:
+                if detail:  # xato sababi YOKI (rasm provayderlari uchun) balans matni
                     line += f"\n     <i>{_esc(detail)}</i>"
                 lines.append(line)
         lines.append("")
@@ -934,6 +1052,56 @@ async def _run_music_check() -> str:
 
 
 # ============================================================
+
+
+_RENDER_TERMINAL_SUCCESS = {"live"}
+_RENDER_TERMINAL_FAILURE = {"build_failed", "update_failed", "canceled", "deactivated"}
+
+async def _watch_render_deploy(application, api_key: str, service_id: str, deploy_id: str, service_name: str = "Render service"):
+    """Deploy yakunlanguncha kuzatadi; bot restart bo'lsa storage'dan davom etadi."""
+    try:
+        for _ in range(180):  # ko'pi bilan 60 daqiqa
+            await asyncio.sleep(20)
+            try:
+                deploy = await render_api.get_deploy(api_key, service_id, deploy_id)
+            except Exception as poll_exc:
+                logger.warning("Render deploy holatini tekshirishda vaqtinchalik xato (%s): %s", deploy_id, poll_exc)
+                continue
+            status = str(deploy.get("status") or "").lower()
+            if status in _RENDER_TERMINAL_SUCCESS:
+                for admin_id in config.ADMIN_IDS:
+                    try:
+                        await application.bot.send_message(admin_id,
+                            f"✅ <b>Deploy amalga oshdi</b>\n\nServis: <b>{_esc(service_name)}</b>\nDeploy ID: <code>{_esc(deploy_id)}</code>", parse_mode="HTML")
+                    except Exception as exc:
+                        logger.warning("Deploy xabari admin %s ga yuborilmadi: %s", admin_id, exc)
+                storage.finish_render_pending_deploy(deploy_id)
+                return
+            if status in _RENDER_TERMINAL_FAILURE:
+                for admin_id in config.ADMIN_IDS:
+                    try:
+                        await application.bot.send_message(admin_id,
+                            f"❌ <b>Deploy muvaffaqiyatsiz yakunlandi</b>\n\nServis: <b>{_esc(service_name)}</b>\nHolat: <code>{_esc(status)}</code>\nDeploy ID: <code>{_esc(deploy_id)}</code>", parse_mode="HTML")
+                    except Exception:
+                        pass
+                storage.finish_render_pending_deploy(deploy_id)
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Render deploy monitoring xatosi: %s", deploy_id)
+
+def resume_render_deploy_notifications(application):
+    """Bot qayta ishga tushganda hali yakunlanmagan deploy kuzatuvini tiklaydi."""
+    for item in storage.get_render_pending_deploys():
+        sid = str(item.get("service_id") or "")
+        account = next((a for a in config.RENDER_ACCOUNTS if a.get("service_id") == sid), None)
+        if not account:
+            account = config.RENDER_ACCOUNTS[0] if config.RENDER_ACCOUNTS else None
+        if account and sid and item.get("deploy_id"):
+            application.create_task(_watch_render_deploy(application, account["key"], sid,
+                str(item["deploy_id"]), str(item.get("service_name") or "Render service")))
+
 # ☁️ RENDER — Render API boshqaruv paneli
 # ============================================================
 
@@ -965,7 +1133,7 @@ def _render_service_name(service: dict) -> str:
     return str(name)
 
 
-def _render_service_keyboard(services: list[dict]) -> InlineKeyboardMarkup:
+def _render_service_keyboard(services: list[dict], multi_account: bool = False) -> InlineKeyboardMarkup:
     rows = []
     for service in services[:30]:
         sid = str(service.get("id", ""))
@@ -973,28 +1141,47 @@ def _render_service_keyboard(services: list[dict]) -> InlineKeyboardMarkup:
             continue
         status = service.get("suspended") or service.get("status")
         label = f"{_render_status_icon(status)} {_render_service_name(service)}"
+        if multi_account:
+            acc_label = service.get("_render_account_label")
+            if acc_label:
+                label = f"{label} · {acc_label}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"dev:rsvc:{sid}")])
     rows.append([InlineKeyboardButton("🔄 Yangilash", callback_data="dev:render")])
     rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="dev:menu")])
     return InlineKeyboardMarkup(rows)
 
 
-def _render_menu_text(services: list[dict], owner_id: str) -> str:
+def _render_menu_text(services: list[dict], accounts: list[dict]) -> str:
     if not services:
+        workspaces = ", ".join(_esc(a.get("owner_id") or "avtomatik") for a in accounts) or "avtomatik"
         return (
             "☁️ <b>RENDER</b>\n\n"
-            "Servis topilmadi. Render API kaliti yoki workspace sozlamasini tekshiring.\n\n"
-            f"Workspace: <code>{_esc(owner_id or 'avtomatik')}</code>"
+            "Servis topilmadi. Render API kalit(lar)i yoki workspace sozlamasini tekshiring.\n\n"
+            f"Ulangan hisoblar: <b>{len(accounts)}</b>\n"
+            f"Workspace(lar): <code>{workspaces}</code>"
         )
     lines = [
         "☁️ <b>RENDER boshqaruv paneli</b>",
-        f"🏢 Workspace: <code>{_esc(owner_id or 'avtomatik')}</code>",
+        f"👤 Ulangan hisoblar: <b>{len(accounts)}</b>",
         f"📦 Servislar: <b>{len(services)}</b>",
         "",
         "Render API orqali servis, deploy va loglarni boshqarishingiz mumkin.",
         "Servisni tanlang:",
     ]
     return "\n".join(lines)
+
+
+def _keepalive_status_line(service_id: str) -> str:
+    """😴 Uxlamaslik holati (yoqilgan/o'chiq + oxirgi ping natijasi)."""
+    if not storage.get_keepalive(service_id):
+        return "😴 Uxlamaslik: <code>o'chiq</code>\n"
+    last = render_keepalive.get_last_ping(service_id)
+    if not last:
+        return "😴 Uxlamaslik: ✅ <code>yoqilgan</code> (har 5 daqiqada ping)\n"
+    ago = max(0, int(time.time() - last["ts"]) // 60)
+    icon = "✅" if last["ok"] else "⚠️"
+    return (f"😴 Uxlamaslik: ✅ <code>yoqilgan</code>\n"
+            f"   oxirgi ping: {icon} <code>{_esc(last['detail'])}</code>, {ago} daq oldin\n")
 
 
 def _render_service_text(service: dict) -> str:
@@ -1007,15 +1194,19 @@ def _render_service_text(service: dict) -> str:
     url = service.get("serviceDetails", {}).get("url") if isinstance(service.get("serviceDetails"), dict) else None
     if not url:
         url = service.get("url") or "—"
+    acc_label = service.get("_render_account_label")
+    acc_line = f"👤 Hisob: <code>{_esc(acc_label)}</code>\n" if acc_label else ""
     return (
         f"☁️ <b>{_esc(_render_service_name(service))}</b>\n\n"
+        f"{acc_line}"
         f"🆔 ID: <code>{_esc(sid)}</code>\n"
         f"📦 Turi: <code>{_esc(service_type)}</code>\n"
         f"📡 Holat: {_render_status_icon(str(status))} <code>{_esc(status)}</code>\n"
         f"🌿 Branch: <code>{_esc(branch)}</code>\n"
         f"🔄 Auto Deploy: <code>{_esc(auto if auto is not None else '—')}</code>\n"
         f"🔗 Repo: <code>{_esc(repo)}</code>\n"
-        f"🌐 URL: <code>{_esc(url)}</code>\n\n"
+        f"🌐 URL: <code>{_esc(url)}</code>\n"
+        f"{_keepalive_status_line(sid)}\n"
         "Kerakli amalni tanlang:"
     )
 
@@ -1038,6 +1229,10 @@ def _render_service_keyboard_for(service: dict) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("🟡 O'rta log", callback_data=f"dev:rlogs:{sid}:medium")],
         [InlineKeyboardButton("📄 Loglarni ko'chirish (PDF)", callback_data=f"dev:rpdf:{sid}")],
+        [InlineKeyboardButton(
+            "😴 Uxlamaslikni o'chirish" if storage.get_keepalive(sid) else "😴 Uxlamaslikni yoqish",
+            callback_data=f"dev:rkeep:{sid}",
+        )],
         [
             InlineKeyboardButton("⏸️ Resume" if suspended else "⏸️ Suspend", callback_data=f"dev:r{'resume' if suspended else 'suspend'}:{sid}"),
             InlineKeyboardButton("🔄 Yangilash", callback_data=f"dev:rsvc:{sid}"),
@@ -1076,6 +1271,10 @@ def _render_settings_keyboard(service: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕/✏️ ENV qo'shish/o'zgartirish", callback_data=f"dev:renvadd:{sid}")],
         [InlineKeyboardButton("🗑 ENV o'chirish", callback_data=f"dev:renvdel:{sid}")],
+        [
+            InlineKeyboardButton("📄 ENV'larni PDF qilish", callback_data=f"dev:renvpdf:{sid}"),
+            InlineKeyboardButton("📥 ENV PDF yuklash", callback_data=f"dev:renvpdfup:{sid}"),
+        ],
         [InlineKeyboardButton(
             "🔴 Auto Deploy o'chirish" if auto else "🟢 Auto Deploy yoqish",
             callback_data=f"dev:rautodeploy:{sid}:{'no' if auto else 'yes'}",
@@ -1148,10 +1347,10 @@ def _render_logs_text(service: dict, logs: list[dict], category: str) -> str:
     return "\n\n".join(lines)[:3950]
 
 
-async def _latest_render_deploy_start(service_id: str):
+async def _latest_render_deploy_start(api_key: str, service_id: str):
     """Eng so'nggi deploy vaqtini topadi; Render log oynasi shu vaqtdan boshlanadi."""
     try:
-        deploys = await render_api.list_deploys(service_id, limit=20)
+        deploys = await render_api.list_deploys(api_key, service_id, limit=20)
     except Exception as exc:
         logger.warning(
             "☁️ Eng so'nggi deployni aniqlab bo'lmadi: %s: %s",
@@ -1204,6 +1403,31 @@ async def _render_api_error(query, exc: Exception, back_callback: str = "dev:ren
     )
 
 
+def _render_account_for_service(context, service_id: str) -> dict[str, str] | None:
+    """RENDER menyusida ro'yxatlanganda saqlangan xaritadan (service_id ->
+    hisob) shu servisga tegishli Render hisobini topadi. Bir nechta
+    RENDER_API_KEY* ulangan bo'lsa, har bir servis o'zi topilgan hisob
+    kaliti bilan boshqariladi — noto'g'ri kalit bilan so'rov yuborilmasligi
+    uchun shart.
+    """
+    accounts_map: dict[str, str] = context.user_data.get("render_service_accounts") or {}
+    account_id = accounts_map.get(str(service_id))
+    if account_id:
+        account = config.get_render_account(account_id)
+        if account:
+            return account
+    # Zaxira variant: xarita topilmasa (masalan bot qayta ishga tushgan bo'lsa),
+    # birinchi ulangan hisobga qaytadi.
+    return config.RENDER_ACCOUNTS[0] if config.RENDER_ACCOUNTS else None
+
+
+def _render_api_key_for_service(context, service_id: str) -> str:
+    account = _render_account_for_service(context, service_id)
+    if not account:
+        raise render_api.RenderAPIError(401, "Render API kaliti sozlanmagan (RENDER_API_KEY).")
+    return account["key"]
+
+
 
 # ============================================================
 # ☁️ GitHub — repository / papka / fayl boshqaruvi
@@ -1251,14 +1475,38 @@ def _github_repo_keyboard(repos: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _github_path_keyboard(repo: str, path_value: str, items: list[dict]) -> InlineKeyboardMarkup:
+_GITHUB_ITEMS_PER_PAGE = 35
+
+def _github_path_keyboard(repo: str, path_value: str, items: list[dict], page: int = 0, show_navigation: bool = True) -> InlineKeyboardMarkup:
+    """Render a Telegram-safe page while preserving global item indexes."""
+    total_pages = max(1, (len(items) + _GITHUB_ITEMS_PER_PAGE - 1) // _GITHUB_ITEMS_PER_PAGE)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * _GITHUB_ITEMS_PER_PAGE
+    visible = items[start:start + _GITHUB_ITEMS_PER_PAGE]
     rows = []
-    for i, item in enumerate(items):
+    for i, item in enumerate(visible, start=start):
         label = f"{github_dev.item_icon(item['type'])} {item['name']}"
         if item["type"] == "file":
             label += f"  ({github_dev.format_size(item['size'])})"
-        rows.append([InlineKeyboardButton(label[:64], callback_data=f"dev:gh:item:{i}")])
+            rows.append([InlineKeyboardButton(label[:64], callback_data=f"dev:gh:item:{i}")])
+        elif item["type"] == "dir":
+            # Papka nomi bosilsa — ichiga kiradi; yonidagi 🗑 tugma bosilsa —
+            # faqat SHU papka (va uning ichidagi hammasi) o'chirish tasdig'i so'raladi.
+            rows.append([
+                InlineKeyboardButton(label[:56], callback_data=f"dev:gh:item:{i}"),
+                InlineKeyboardButton("🗑", callback_data=f"dev:gh:deldir:{i}"),
+            ])
+        else:
+            rows.append([InlineKeyboardButton(label[:64], callback_data=f"dev:gh:item:{i}")])
 
+    if show_navigation and total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"dev:gh:page:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="dev:gh:page:stay"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"dev:gh:page:{page+1}"))
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Yangi fayl qo'shish", callback_data="dev:gh:new")])
     rows.append([InlineKeyboardButton("📤 ZIP loyihani yuklash", callback_data="dev:gh:zip")])
     if path_value:
@@ -1268,7 +1516,7 @@ def _github_path_keyboard(repo: str, path_value: str, items: list[dict]) -> Inli
     return InlineKeyboardMarkup(rows)
 
 
-def _github_path_text(repo: str, path_value: str, items: list[dict]) -> str:
+def _github_path_text(repo: str, path_value: str, items: list[dict], page: int = 0) -> str:
     title = f"📦 <b>{_esc(repo)}</b>"
     title += f"\n📁 <code>/{_esc(path_value)}</code>" if path_value else "\n📁 <code>/</code>"
     if not items:
@@ -1277,6 +1525,11 @@ def _github_path_text(repo: str, path_value: str, items: list[dict]) -> str:
         dirs = sum(1 for x in items if x["type"] == "dir")
         files = sum(1 for x in items if x["type"] == "file")
         title += f"\n\n📁 Papkalar: <b>{dirs}</b>  📄 Fayllar: <b>{files}</b>"
+        pages = max(1, (len(items) + _GITHUB_ITEMS_PER_PAGE - 1) // _GITHUB_ITEMS_PER_PAGE)
+        if pages > 1:
+            first = page * _GITHUB_ITEMS_PER_PAGE + 1
+            last = min(len(items), first + _GITHUB_ITEMS_PER_PAGE - 1)
+            title += f"\n📄 Ko'rsatilmoqda: <b>{first}–{last}</b> / {len(items)} (sahifa {page+1}/{pages})"
     return title
 
 
@@ -1296,11 +1549,37 @@ async def _github_open_path(context: ContextTypes.DEFAULT_TYPE, path_value: str 
     items = await asyncio.to_thread(github_dev.list_directory, repo, path_value, branch)
     context.user_data["github_path"] = path_value
     context.user_data["github_items"] = items
+    context.user_data["github_page"] = 0
+
+    # Old directory listing continuation messages are removed before showing a new folder.
+    listing_chat_id = (context.user_data.get("dev_msg") or (None, None))[0]
+    old_messages = context.user_data.pop("github_listing_messages", [])
+    for message_id in old_messages:
+        try:
+            await context.bot.delete_message(chat_id=listing_chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+    page_count = max(1, (len(items) + _GITHUB_ITEMS_PER_PAGE - 1) // _GITHUB_ITEMS_PER_PAGE)
     await _edit_menu(
         context,
-        _github_path_text(repo, path_value, items),
-        _github_path_keyboard(repo, path_value, items),
+        _github_path_text(repo, path_value, items, 0),
+        _github_path_keyboard(repo, path_value, items, 0, show_navigation=False),
     )
+    # Telegram inline keyboard limit: spread the remaining entries into follow-up messages.
+    # Every button retains its original index in github_items, so existing callbacks remain valid.
+    extra_ids = []
+    for page in range(1, page_count):
+        page_text = _github_path_text(repo, path_value, items, page)
+        page_keyboard = _github_path_keyboard(repo, path_value, items, page, show_navigation=False)
+        sent = await context.bot.send_message(
+            chat_id=listing_chat_id,
+            text=page_text,
+            parse_mode="HTML",
+            reply_markup=page_keyboard,
+        )
+        extra_ids.append(sent.message_id)
+    context.user_data["github_listing_messages"] = extra_ids
 
 
 async def _github_send_file_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1341,6 +1620,13 @@ def _github_confirm_delete_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚠️ Ha, o'chirish", callback_data="dev:gh:delete_yes")],
         [InlineKeyboardButton("⬅️ Bekor qilish", callback_data="dev:gh:file")],
+    ])
+
+
+def _github_confirm_deldir_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚠️ Ha, papkani o'chirish", callback_data="dev:gh:deldir_yes")],
+        [InlineKeyboardButton("⬅️ Bekor qilish", callback_data="dev:gh:backfile")],
     ])
 
 
@@ -1391,7 +1677,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # oldingi "kutilayotgan matn kiritish" holatini tozalaydi — pastda
     # tegishli branch (edit/keyaddprov/keyrepl/keymodel/bulkprov/keybulkscope)
     # kerak bo'lsa uni qaytadan o'rnatadi.
-    if action not in ("edit", "bulkprov", "keyaddprov", "keyrepl", "keymodel", "keybulkscope", "priceedit", "balsearch", "ptsong", "ptemoji", "ptdelay", "ptrevert", "gh", "github", "mt_stop"):
+    if action not in ("edit", "bulkprov", "keyaddprov", "keyrepl", "keymodel", "keybulkscope", "imgaddmanual", "imgmodelmanual", "priceedit", "balsearch", "ptsong", "ptemoji", "ptdelay", "ptrevert", "gh", "github", "mt_stop", "giftconfirm", "adsmin", "adsok"):
         context.user_data.pop("dev_action", None)
 
     # ---------- Asosiy menyu ----------
@@ -1414,10 +1700,154 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_edit_query(query, _moliya_menu_text(), reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
         return DEV_MENU
 
+    # ---------- 🎁 Sovg'a ----------
+    if action == "gift":
+        context.user_data["dev_action"] = {"type": "gift_target"}
+        await _safe_edit_query(
+            query, pay_ui.gift_prompt_text(),
+            reply_markup=pay_ui.gift_target_keyboard(),
+            parse_mode="HTML",
+        )
+        return DEV_MENU
+
+    if action == "gift_target":
+        target = parts[2] if len(parts) > 2 else ""
+        if target == "all":
+            context.user_data["dev_action"] = {"type": "gift_all_mode", "target": "all"}
+            await _safe_edit_query(
+                query, pay_ui.gift_all_mode_text(),
+                reply_markup=pay_ui.gift_all_mode_keyboard(),
+                parse_mode="HTML",
+            )
+            return DEV_MENU
+        if target == "user":
+            context.user_data["dev_action"] = {"type": "gift_target"}
+            await _safe_edit_query(
+                query,
+                "👤 <b>Foydalanuvchini tanlash</b>\n\n"
+                "Telegram ID raqamini yuboring.",
+                reply_markup=_back_keyboard("dev:moliya"),
+                parse_mode="HTML",
+            )
+            return DEV_WAIT_TEXT
+
+    if action == "giftmode":
+        mode = parts[2] if len(parts) > 2 else ""
+        if mode not in ("add", "cap"):
+            await _safe_edit_query(query, "⚠️ Noto'g'ri sovg'a rejimi.", reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
+            return DEV_MENU
+        gift = context.user_data.get("dev_action") or {}
+        if gift.get("type") != "gift_all_mode":
+            await _safe_edit_query(query, "⚠️ Sovg'a sessiyasi topilmadi.", reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
+            return DEV_MENU
+        gift["type"] = "gift_amount"
+        gift["target"] = "all"
+        gift["mode"] = mode
+        context.user_data["dev_action"] = gift
+        await _safe_edit_query(
+            query,
+            pay_ui.gift_amount_prompt("all", mode=mode),
+            _back_keyboard("dev:gift"),
+            parse_mode="HTML",
+        )
+        return DEV_WAIT_TEXT
+
+    if action == "giftconfirm":
+        gift = context.user_data.get("dev_action") or {}
+        if gift.get("type") != "gift_confirm":
+            await _safe_edit_query(query, "⚠️ Sovg'a sessiyasi topilmadi.", reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
+            return DEV_MENU
+        try:
+            result = await asyncio.to_thread(
+                pay_ui.admin_gift,
+                gift["target"], int(gift["amount"]), update.effective_user.id,
+                gift.get("mode", "add"),
+            )
+            target = gift["target"]
+            if target == "all":
+                msg = (
+                    "✅ <b>Sovg'a tarqatildi.</b>\n\n"
+                    f"👥 Foydalanuvchilar: <b>{result['count']}</b> ta\n"
+                    f"🎯 Rejim: <b>{'Qo\'shish' if gift.get('mode', 'add') == 'add' else 'Oshmagan'}</b>\n"
+                    f"💰 Belgilangan summa: <b>{pay_ui._fmt_sum(gift['amount'])}</b>\n"
+                    f"➕ Haqiqatan qo'shilgan: <b>{pay_ui._fmt_sum(result['total'])}</b>\n"
+                    f"👤 Pul olganlar: <b>{result['count']}</b> ta"
+                )
+            else:
+                mode_text = "➕ Qo'shish" if gift.get("mode", "add") == "add" else "🎯 Oshmagan"
+                if result["count"] == 0:
+                    msg = (
+                        "ℹ️ <b>Sovg'a qo'shilmadi.</b>\n\n"
+                        f"🆔 ID: <code>{pay_ui._esc(target)}</code>\n"
+                        f"🎯 Rejim: <b>{mode_text}</b>\n"
+                        f"💳 Joriy balans: <b>{pay_ui._fmt_sum(result['tx']['balance_after'])}</b>\n\n"
+                        "Balans belgilangan summaga teng yoki undan katta."
+                    )
+                else:
+                    msg = (
+                        "✅ <b>Sovg'a balansga tushdi.</b>\n\n"
+                        f"🆔 ID: <code>{pay_ui._esc(target)}</code>\n"
+                        f"🎯 Rejim: <b>{mode_text}</b>\n"
+                        f"➕ Qo'shilgan summa: <b>{pay_ui._fmt_sum(result['total'])}</b>\n"
+                        f"💳 Yangi balans: <b>{pay_ui._fmt_sum(result['tx']['balance_after'])}</b>"
+                    )
+            context.user_data.pop("dev_action", None)
+            await _safe_edit_query(query, msg, reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
+        except Exception as exc:
+            logger.error("🎁 Admin gift xatosi: %s", exc, exc_info=True)
+            await _safe_edit_query(query, f"❌ Sovg'a berishda xato: {_esc(str(exc))}", reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
+            context.user_data.pop("dev_action", None)
+        return DEV_MENU
+
+    if action == "giftcancel":
+        context.user_data.pop("dev_action", None)
+        await _safe_edit_query(query, "❌ Sovg'a bekor qilindi.", reply_markup=_moliya_menu_keyboard(), parse_mode="HTML")
+        return DEV_MENU
+
+    # ---------- 👥 Foydalanuvchilar ----------
+    if action == "users":
+        page = int(parts[2]) if len(parts) > 2 else 0
+        all_ids = list(reversed(storage.get_all_users()))
+        page_ids = all_ids[page * pay_ui.USERS_PER_PAGE:(page + 1) * pay_ui.USERS_PER_PAGE]
+        await pay_ui.refresh_user_profiles(context.bot, page_ids)
+        text_users, kb_users = pay_ui.users_page(page)
+        await _safe_edit_query(query, text_users, reply_markup=kb_users, parse_mode="HTML")
+        return DEV_MENU
+
+    if action == "user":
+        user_id = int(parts[2])
+        await pay_ui.refresh_user_profiles(context.bot, [user_id])
+        await _safe_edit_query(
+            query, pay_ui.user_detail_text(user_id),
+            reply_markup=pay_ui.user_detail_keyboard(user_id), parse_mode="HTML",
+        )
+        return DEV_MENU
+
+    if action == "userid":
+        user_id = int(parts[2])
+        await _safe_edit_query(
+            query, pay_ui.user_detail_text(user_id),
+            reply_markup=pay_ui.user_detail_keyboard(user_id), parse_mode="HTML",
+        )
+        return DEV_MENU
+
+    if action == "usertopup":
+        user_id = int(parts[2])
+        context.user_data["dev_action"] = {"type": "user_topup", "user_id": user_id}
+        await _safe_edit_query(
+            query, pay_ui.user_topup_prompt(user_id),
+            reply_markup=_back_keyboard(f"dev:user:{user_id}"), parse_mode="HTML",
+        )
+        return DEV_WAIT_TEXT
+
     # ---------- 📝 Boshqariladigan testlar ----------
     if action == "managed_tests" or action.startswith("mt_"):
         from handlers import managed_tests
         return await managed_tests.handle_dev_callback(action, parts, update, context, query, DEV_MENU, DEV_WAIT_TEXT)
+    # ---------- 📢 Reklama ----------
+    from handlers import ads as ads_ui
+    if action in ads_ui.ACTIONS:
+        return await ads_ui.handle_dev_callback(action, parts, update, context, query, DEV_MENU, DEV_WAIT_TEXT)
     # ---------- 🧪 Loyiha testlari ----------
     if action == "tests":
         await _safe_edit_query(query, "🧪 <b>tests/ papkasi tekshirilmoqda...</b>\nBarcha testlar ishga tushirilmoqda, biroz kuting.", parse_mode="HTML")
@@ -1524,6 +1954,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "(Account ID va API tokenni dash.cloudflare.com sahifasining "
                 "o'ng tomonidagi \"Account ID\" va Workers AI bo'limidan olasiz.)"
             )
+        elif provider in config.IMAGE_PROVIDERS:
+            prompt_text = (
+                f"➕ <b>{_esc(_provider_label(provider))}</b> — yangi API kalitni xabar qilib yuboring.\n"
+                "Kalit xabari chatdan avtomatik o'chiriladi. Keyingi qadamda modelni "
+                "ro'yxatdan tanlaysiz yoki qo'lda yozasiz."
+            )
         else:
             prompt_text = f"➕ <b>{_esc(_provider_label(provider))}</b> — yangi API kalitni xabar qilib yuboring:"
         await _safe_edit_query(query, prompt_text, reply_markup=_back_keyboard("dev:keyadd"), parse_mode="HTML")
@@ -1538,6 +1974,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_back_keyboard(f"dev:keyview:{provider}:{idx}"),
         )
         return DEV_WAIT_TEXT
+
+    if action == "keymodel" and parts[2] in config.IMAGE_PROVIDERS:
+        provider, idx = parts[2], int(parts[3])
+        await _safe_edit_query(
+            query,
+            _img_model_picker_text(provider, f"✏️ <b>{_esc(_provider_label(provider))} — Kalit #{idx}</b>: yangi model"),
+            reply_markup=_img_model_picker_keyboard(
+                provider, f"dev:imgmodel:{provider}:{idx}", f"dev:imgmodelmanual:{provider}:{idx}", f"dev:keyview:{provider}:{idx}"),
+            parse_mode="HTML",
+        )
+        return DEV_MENU
 
     if action == "keymodel":
         provider, idx = parts[2], int(parts[3])
@@ -1585,6 +2032,125 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return DEV_WAIT_BULK_MODEL
 
+
+    # ---------- 🎨 Rasm provayderlari: model tanlash / tekshirish / test ----------
+    if action == "imgadd":  # dev:imgadd:<provider>:<model_index>
+        provider, mi = parts[2], int(parts[3])
+        pending = context.user_data.get("dev_pending_img_key") or {}
+        model = _img_model_by_index(provider, mi)
+        if pending.get("provider") != provider or not pending.get("key") or not model:
+            await _safe_edit_query(
+                query, "⚠️ Kalit topilmadi (bot qayta ishga tushgan bo'lishi mumkin). Kalitni qaytadan qo'shing.\n\n"
+                + _keys_menu_text(), reply_markup=_keys_menu_keyboard(), parse_mode="HTML")
+            return DEV_MENU
+        context.user_data.pop("dev_pending_img_key", None)
+        idx = config.add_key(provider, pending["key"], model)
+        await _safe_edit_query(
+            query,
+            f"✅ {_esc(_provider_label(provider))} kalit #{idx} qo'shildi (model: <code>{_esc(model)}</code>).\n"
+            "\"🩺 Kalitlarni tekshirish\" orqali balans va modelni tekshiring.\n\n" + _keys_menu_text(),
+            reply_markup=_keys_menu_keyboard(), parse_mode="HTML")
+        return DEV_MENU
+
+    if action == "imgaddmanual":  # dev:imgaddmanual:<provider>
+        provider = parts[2]
+        context.user_data["dev_action"] = {"type": "add_key_model", "provider": provider}
+        await _safe_edit_query(
+            query, f"✍️ <b>{_esc(_provider_label(provider))}</b> — model nomini xabar qilib yuboring "
+                   "(masalan <code>flux-2-pro</code> yoki <code>sd3.5-large</code>):",
+            reply_markup=_back_keyboard("dev:keyadd"), parse_mode="HTML")
+        return DEV_WAIT_TEXT
+
+    if action == "imgmodel":  # dev:imgmodel:<provider>:<key_idx>:<model_index>
+        provider, idx, mi = parts[2], int(parts[3]), int(parts[4])
+        model = _img_model_by_index(provider, mi)
+        if model:
+            config.update_key_field(provider, idx, "model", model)
+        await _safe_edit_query(
+            query, ("✅ Model yangilandi.\n\n" if model else "⚠️ Model topilmadi.\n\n") + _key_view_text(provider, idx),
+            reply_markup=_key_view_keyboard(provider, idx), parse_mode="HTML")
+        return DEV_MENU
+
+    if action == "imgmodelmanual":  # dev:imgmodelmanual:<provider>:<key_idx>
+        provider, idx = parts[2], int(parts[3])
+        context.user_data["dev_action"] = {"type": "key_field", "provider": provider, "index": idx, "field": "model"}
+        await _safe_edit_query(
+            query, f"✍️ {_esc(_provider_label(provider))} — Kalit #{idx}\nYangi model nomini xabar qilib yuboring:",
+            reply_markup=_back_keyboard(f"dev:keyview:{provider}:{idx}"), parse_mode="HTML")
+        return DEV_WAIT_TEXT
+
+    if action == "keycheck1":  # bitta kalitni tekshirish
+        provider, idx = parts[2], int(parts[3])
+        pool = config.KEY_POOLS.get(provider, [])
+        if not (1 <= idx <= len(pool)):
+            await _safe_edit_query(query, "⚠️ Bu kalit topilmadi.", reply_markup=_keys_menu_keyboard())
+            return DEV_MENU
+        entry = pool[idx - 1]
+        await _safe_edit_query(query, "🩺 Tekshirilmoqda, biroz kuting...")
+        status, detail = await ai_clients.test_key(provider, entry.get("key", ""), entry.get("model", ""), index=idx)
+        icon, text = _STATUS_ICONS.get(status, "⚠️"), _STATUS_TEXT.get(status, status)
+        report = f"🩺 {icon} <b>{_esc(text)}</b>" + (f"\n<i>{_esc(detail)}</i>" if detail else "")
+        await _safe_edit_query(query, report + "\n\n" + _key_view_text(provider, idx),
+                               reply_markup=_key_view_keyboard(provider, idx), parse_mode="HTML")
+        return DEV_MENU
+
+    if action == "keyimgtest":  # haqiqiy (pullik) test rasm
+        provider, idx = parts[2], int(parts[3])
+        pool = config.KEY_POOLS.get(provider, [])
+        if provider not in config.IMAGE_PROVIDERS or not (1 <= idx <= len(pool)):
+            await _safe_edit_query(query, "⚠️ Bu kalit topilmadi.", reply_markup=_keys_menu_keyboard())
+            return DEV_MENU
+        entry = pool[idx - 1]
+        _, cost_txt = image_clients.estimate_cost(provider, entry.get("model", ""), 1)
+        await _safe_edit_query(query, f"🧪 Test rasm yaratilmoqda (taxminiy xarajat: {_esc(cost_txt)})...", parse_mode="HTML")
+        res = await image_clients.generate_image(
+            provider, entry.get("key", ""), entry.get("model", ""),
+            "Flat vector illustration of an open book and a glowing light bulb on a desk, "
+            "clean educational style, white background", aspect="1:1", use_cache=False)
+        if res.ok:
+            try:
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id, photo=io.BytesIO(res.data),
+                    caption=f"🧪 {_provider_label(provider)} / {entry.get('model')} — test rasm"
+                            + (f" (narx: {res.cost_credits:g} kredit)" if res.cost_credits is not None else ""))
+                msg = "✅ Test rasm yaratildi va yuborildi."
+            except Exception as exc:
+                msg = f"⚠️ Rasm yaratildi, lekin Telegramga yuborib bo'lmadi: {_esc(type(exc).__name__)}"
+        else:
+            msg = f"❌ {_esc(_STATUS_TEXT.get(res.status, res.status))}: {_esc(res.detail)}"
+        await _safe_edit_query(query, msg + "\n\n" + _key_view_text(provider, idx),
+                               reply_markup=_key_view_keyboard(provider, idx), parse_mode="HTML")
+        return DEV_MENU
+
+    # ---------- 🖼 Kurs ishi rasmlari: admin standartlari ----------
+    if action == "cwimg":
+        await _safe_edit_query(query, _cwimg_menu_text(), reply_markup=_cwimg_menu_keyboard(), parse_mode="HTML")
+        return DEV_MENU
+
+    if action in ("cwimgtoggle", "cwimgprov", "cwimgcount", "cwimgmodel"):
+        d = config.COURSE_IMAGE_DEFAULTS
+        if action == "cwimgtoggle":
+            config.update_course_image_defaults(enabled=not d["enabled"])
+        elif action == "cwimgprov":
+            config.update_course_image_defaults(provider=parts[2], model="")  # model provayderga bog'liq
+        elif action == "cwimgcount":
+            config.update_course_image_defaults(count=int(parts[2]))
+        else:  # cwimgmodel:<model_index>
+            model = _img_model_by_index(d["provider"], int(parts[2]))
+            config.update_course_image_defaults(model=model)
+        await _safe_edit_query(query, _cwimg_menu_text(), reply_markup=_cwimg_menu_keyboard(), parse_mode="HTML")
+        return DEV_MENU
+
+    if action == "cwimgmodelmenu":
+        provider = config.COURSE_IMAGE_DEFAULTS["provider"]
+        if provider == "auto":
+            await _safe_edit_query(query, _cwimg_menu_text(), reply_markup=_cwimg_menu_keyboard(), parse_mode="HTML")
+            return DEV_MENU
+        await _safe_edit_query(
+            query, _img_model_picker_text(provider, "🧩 <b>Kurs ishi rasmlari — model</b>"),
+            reply_markup=_img_model_picker_keyboard(provider, "dev:cwimgmodel", "dev:cwimg", "dev:cwimg"),
+            parse_mode="HTML")
+        return DEV_MENU
 
     # ---------- ☁️ GitHub ----------
     if action == "github":
@@ -1640,6 +2206,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _github_open_path(context, "")
             except Exception as exc:
                 await _github_error(context, exc, "dev:gh:repos")
+            return DEV_MENU
+
+        if sub == "page":
+            page_value = parts[3] if len(parts) > 3 else "0"
+            items = context.user_data.get("github_items") or []
+            if page_value != "stay":
+                try:
+                    page = int(page_value)
+                except (TypeError, ValueError):
+                    page = 0
+                pages = max(1, (len(items) + _GITHUB_ITEMS_PER_PAGE - 1) // _GITHUB_ITEMS_PER_PAGE)
+                page = max(0, min(page, pages - 1))
+                context.user_data["github_page"] = page
+            else:
+                page = int(context.user_data.get("github_page", 0) or 0)
+            repo = context.user_data.get("github_repo", "")
+            path_value = context.user_data.get("github_path", "")
+            await _safe_edit_query(
+                query, _github_path_text(repo, path_value, items, page),
+                reply_markup=_github_path_keyboard(repo, path_value, items, page),
+                parse_mode="HTML",
+            )
             return DEV_MENU
 
         if sub == "item":
@@ -1777,29 +2365,95 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _github_error(context, exc, "dev:gh:file")
             return DEV_MENU
 
-    # ---------- ☁️ RENDER ----------
-    if action == "render":
-        if not config.RENDER_API_KEY:
+        if sub == "deldir":
+            idx = int(parts[3])
+            items = context.user_data.get("github_items") or []
+            if not (0 <= idx < len(items)) or items[idx]["type"] != "dir":
+                await _github_error(context, github_dev.GitHubDevError("Papka ro'yxati eskirgan. Yangilang."), "dev:gh:backfile")
+                return DEV_MENU
+            item = items[idx]
+            context.user_data["github_del_dir_path"] = item["path"]
+            context.user_data["github_del_dir_name"] = item["name"]
             await _safe_edit_query(
                 query,
-                "☁️ <b>RENDER</b>\n\n❌ <code>RENDER_API_KEY</code> sozlanmagan.\n\n"
+                f"🗑 <b>Papkani o'chirish</b>\n\n📁 <code>{_esc(item['path'])}</code>\n\n"
+                "⚠️ Bu papka ichidagi <b>barcha fayllar va ichki papkalar</b> "
+                "GitHub'dan o'chiriladi. Repository'dagi boshqa hech narsaga tegilmaydi. "
+                "Bu amal darhol commit qilinadi. Davom etasizmi?",
+                reply_markup=_github_confirm_deldir_keyboard(),
+            )
+            return DEV_MENU
+
+        if sub == "deldir_yes":
+            repo = context.user_data.get("github_repo")
+            branch = context.user_data.get("github_branch") or "main"
+            dir_path = context.user_data.get("github_del_dir_path")
+            if not repo or not dir_path:
+                await _github_error(context, github_dev.GitHubDevError("Papka tanlanmagan."), "dev:github")
+                return DEV_MENU
+            await _safe_edit_query(query, "🗑 Papka GitHub'dan o'chirilmoqda...", parse_mode="HTML")
+            try:
+                result = await asyncio.to_thread(github_dev.delete_directory, repo, dir_path, branch)
+                parent = dir_path.rsplit("/", 1)[0] if "/" in dir_path else ""
+                context.user_data.pop("github_del_dir_path", None)
+                context.user_data.pop("github_del_dir_name", None)
+                items = await asyncio.to_thread(github_dev.list_directory, repo, parent, branch)
+                context.user_data["github_path"] = parent
+                context.user_data["github_items"] = items
+                await _safe_edit_query(
+                    query,
+                    f"✅ <b>Papka o'chirildi:</b> <code>{_esc(dir_path)}</code>\n"
+                    f"🗑 {result['deleted_files']} ta fayl o'chirildi. Boshqa hech narsaga tegilmadi.\n\n"
+                    + _github_path_text(repo, parent, items, 0),
+                    reply_markup=_github_path_keyboard(repo, parent, items, 0),
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                await _github_error(context, exc, "dev:gh:backfile")
+            return DEV_MENU
+
+    # ---------- ☁️ RENDER ----------
+    if action == "render":
+        accounts = config.RENDER_ACCOUNTS
+        if not accounts:
+            await _safe_edit_query(
+                query,
+                "☁️ <b>RENDER</b>\n\n❌ Hech qanday Render API kaliti sozlanmagan.\n\n"
                 "Render Dashboard → Account Settings → API Keys orqali API Key yarating "
-                "va Render Environment Variables'ga <code>RENDER_API_KEY</code> nomi bilan qo'ying.",
+                "va Render Environment Variables'ga <code>RENDER_API_KEY</code> nomi bilan qo'ying.\n\n"
+                "Yana bir nechta hisob ulash uchun <code>RENDER_API_KEY2</code>, "
+                "<code>RENDER_API_KEY3</code>, ... kabi ketma-ket raqamlangan nomlar bilan "
+                "qo'shimcha kalitlar qo'shishingiz mumkin.",
                 reply_markup=_back_keyboard("dev:menu"), parse_mode="HTML",
             )
             return DEV_MENU
         await _safe_edit_query(query, "☁️ Render servislar olinmoqda...", parse_mode="HTML")
         try:
-            owner_id = config.RENDER_OWNER_ID
-            services = await render_api.list_services(owner_id=owner_id)
-            if config.RENDER_SERVICE_ID:
-                services.sort(key=lambda item: str(item.get("id", "")) != config.RENDER_SERVICE_ID)
-            if not owner_id and services:
-                owner_id = str(services[0].get("ownerId") or services[0].get("owner_id") or "")
-            context.user_data["render_owner_id"] = owner_id
+            services: list[dict] = []
+            accounts_map: dict[str, str] = {}
+            errors: list[str] = []
+            for account in accounts:
+                try:
+                    acc_services = await render_api.list_services(account["key"], owner_id=account.get("owner_id", ""))
+                except Exception as exc:
+                    errors.append(f"{account['label']}: {render_api.human_error(exc)}")
+                    continue
+                for svc in acc_services:
+                    svc["_render_account_label"] = account["label"]
+                    sid = str(svc.get("id", ""))
+                    if sid:
+                        accounts_map[sid] = account["id"]
+                    services.append(svc)
+            context.user_data["render_service_accounts"] = accounts_map
+            default_ids = {a["service_id"] for a in accounts if a.get("service_id")}
+            if default_ids:
+                services.sort(key=lambda item: str(item.get("id", "")) not in default_ids)
+            menu_text = _render_menu_text(services, accounts)
+            if errors:
+                menu_text += "\n\n⚠️ " + "\n⚠️ ".join(_esc(e) for e in errors)
             await _safe_edit_query(
-                query, _render_menu_text(services, owner_id),
-                reply_markup=_render_service_keyboard(services), parse_mode="HTML",
+                query, menu_text,
+                reply_markup=_render_service_keyboard(services, multi_account=len(accounts) > 1), parse_mode="HTML",
             )
         except Exception as exc:
             await _render_api_error(query, exc)
@@ -1809,7 +2463,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "☁️ Servis ma'lumotlari olinmoqda...", parse_mode="HTML")
         try:
-            service = await render_api.get_service(service_id)
+            account = _render_account_for_service(context, service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            service = await render_api.get_service(api_key, service_id)
+            if account:
+                service["_render_account_label"] = account["label"]
             context.user_data["render_service"] = service
             await _safe_edit_query(
                 query, _render_service_text(service),
@@ -1819,11 +2477,67 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _render_api_error(query, exc)
         return DEV_MENU
 
+    if action == "rkeep":
+        service_id = parts[2]
+        try:
+            service = context.user_data.get("render_service")
+            if not isinstance(service, dict) or str(service.get("id", "")) != service_id:
+                api_key = _render_api_key_for_service(context, service_id)
+                service = await render_api.get_service(api_key, service_id)
+                account = _render_account_for_service(context, service_id)
+                if account:
+                    service["_render_account_label"] = account["label"]
+                context.user_data["render_service"] = service
+            if storage.get_keepalive(service_id):
+                storage.remove_keepalive(service_id)
+                render_keepalive.forget(service_id)
+                note = "😴 <b>Uxlamaslik o'chirildi.</b>"
+            else:
+                url = render_api.get_public_url(service)
+                if not url:
+                    await _safe_edit_query(
+                        query,
+                        "❌ Bu servisning ochiq (public) URL manzili yo'q (worker/cron/private servis), "
+                        "shuning uchun ping yuborib bo'lmaydi.",
+                        reply_markup=_back_keyboard(f"dev:rsvc:{service_id}"), parse_mode="HTML",
+                    )
+                    return DEV_MENU
+                storage.set_keepalive(service_id, _render_service_name(service), url)
+                render_keepalive.start()  # allaqachon ishlayotgan bo'lsa e'tiborsiz qoldiriladi
+                # Birinchi pingni darhol yuboramiz (menyuni kutdirmasdan, fonda).
+                context.application.create_task(render_keepalive.ping_now(service_id))
+                note = "😴 <b>Uxlamaslik yoqildi.</b> Servisga har 5 daqiqada ping yuboriladi."
+            await _safe_edit_query(
+                query, note + "\n\n" + _render_service_text(service),
+                reply_markup=_render_service_keyboard_for(service), parse_mode="HTML",
+            )
+        except Exception as exc:
+            await _render_api_error(query, exc, f"dev:rsvc:{service_id}")
+        return DEV_MENU
+
     if action == "rdeploy":
         service_id = parts[2]
+        import cancel_registry
+        running = cancel_registry.active_jobs(exclude=asyncio.current_task())
+        if running:
+            unique_users = sorted({uid for _, uid in running})
+            await _safe_edit_query(query,
+                "⛔ <b>Deploy to'xtatildi.</b>\n\nHozir bot foydalanuvchi topshirig'ini bajaryapti. "
+                f"Faol topshiriqlar: <b>{len(running)}</b> ta.\n"
+                "Topshiriqlar tugagach deployni qayta bosing.",
+                reply_markup=_back_keyboard(f"dev:rsvc:{service_id}"), parse_mode="HTML")
+            logger.info("Render deploy bloklandi: %d faol user update", len(running))
+            return DEV_MENU
         await _safe_edit_query(query, "🚀 Deploy ishga tushirilmoqda...", parse_mode="HTML")
         try:
-            deploy = await render_api.trigger_deploy(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            deploy = await render_api.trigger_deploy(api_key, service_id)
+            deploy_id = str(deploy.get("id") or "")
+            if deploy_id:
+                service = context.user_data.get("render_service") or {}
+                service_name = str(service.get("name") or service.get("serviceDetails", {}).get("name") or service_id)
+                storage.add_render_pending_deploy(service_id, deploy_id, service_name)
+                context.application.create_task(_watch_render_deploy(context.application, api_key, service_id, deploy_id, service_name))
             status = deploy.get("status") or "queued"
             await _safe_edit_query(
                 query,
@@ -1841,9 +2555,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "rdeployclear":
         service_id = parts[2]
+        import cancel_registry
+        running = cancel_registry.active_jobs(exclude=asyncio.current_task())
+        if running:
+            await _safe_edit_query(query,
+                "⛔ <b>Deploy to'xtatildi.</b>\n\nBot hozir foydalanuvchi topshirig'ini bajaryapti. "
+                f"Faol topshiriqlar: <b>{len(running)}</b> ta. Tugagach qayta urinib ko'ring.",
+                reply_markup=_back_keyboard(f"dev:rsvc:{service_id}"), parse_mode="HTML")
+            return DEV_MENU
         await _safe_edit_query(query, "🧹🚀 Cache tozalanib deploy qilinmoqda...", parse_mode="HTML")
         try:
-            deploy = await render_api.trigger_deploy(service_id, clear_cache=True)
+            api_key = _render_api_key_for_service(context, service_id)
+            deploy = await render_api.trigger_deploy(api_key, service_id, clear_cache=True)
+            deploy_id = str(deploy.get("id") or "")
+            if deploy_id:
+                service = context.user_data.get("render_service") or {}
+                service_name = str(service.get("name") or service_id)
+                storage.add_render_pending_deploy(service_id, deploy_id, service_name)
+                context.application.create_task(_watch_render_deploy(context.application, api_key, service_id, deploy_id, service_name))
             await _safe_edit_query(
                 query,
                 "✅ <b>Cache tozalangan deploy ishga tushdi.</b>\n\n"
@@ -1859,7 +2588,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id, deploy_id = parts[2], parts[3]
         await _safe_edit_query(query, "🛑 Deploy bekor qilinmoqda...", parse_mode="HTML")
         try:
-            await render_api.cancel_deploy(service_id, deploy_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            await render_api.cancel_deploy(api_key, service_id, deploy_id)
             await _safe_edit_query(
                 query, f"✅ <b>Deploy bekor qilindi.</b>\n\nID: <code>{_esc(deploy_id)}</code>",
                 reply_markup=_back_keyboard(f"dev:rdeploys:{service_id}"), parse_mode="HTML",
@@ -1872,7 +2602,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "🔄 Servis restart qilinmoqda...", parse_mode="HTML")
         try:
-            await render_api.restart_service(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            await render_api.restart_service(api_key, service_id)
             await _safe_edit_query(
                 query, "✅ <b>Restart buyrug'i Render'ga yuborildi.</b>",
                 reply_markup=_back_keyboard(f"dev:rsvc:{service_id}"), parse_mode="HTML",
@@ -1885,7 +2616,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "⏸️ Servis to'xtatilmoqda...", parse_mode="HTML")
         try:
-            await render_api.suspend_service(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            await render_api.suspend_service(api_key, service_id)
             await _safe_edit_query(query, "✅ <b>Servis suspend qilindi.</b>", reply_markup=_back_keyboard(f"dev:rsvc:{service_id}"), parse_mode="HTML")
         except Exception as exc:
             await _render_api_error(query, exc, f"dev:rsvc:{service_id}")
@@ -1895,7 +2627,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "▶️ Servis tiklanmoqda...", parse_mode="HTML")
         try:
-            await render_api.resume_service(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            await render_api.resume_service(api_key, service_id)
             await _safe_edit_query(query, "✅ <b>Servis resume qilindi.</b>", reply_markup=_back_keyboard(f"dev:rsvc:{service_id}"), parse_mode="HTML")
         except Exception as exc:
             await _render_api_error(query, exc, f"dev:rsvc:{service_id}")
@@ -1905,8 +2638,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "⚙️ Render sozlamalari olinmoqda...", parse_mode="HTML")
         try:
-            service = await render_api.get_service(service_id)
-            env_vars = await render_api.list_env_vars(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            service = await render_api.get_service(api_key, service_id)
+            env_vars = await render_api.list_env_vars(api_key, service_id)
             await _safe_edit_query(
                 query, _render_settings_text(service, env_vars),
                 reply_markup=_render_settings_keyboard(service), parse_mode="HTML",
@@ -1917,7 +2651,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "renvadd":
         service_id = parts[2]
-        context.user_data["dev_action"] = {"type": "render_env_upsert", "service_id": service_id}
+        account = _render_account_for_service(context, service_id)
+        context.user_data["dev_action"] = {
+            "type": "render_env_upsert",
+            "service_id": service_id,
+            "account_id": account["id"] if account else "",
+        }
         await _safe_edit_query(
             query,
             "🔐 <b>Environment variable qo'shish/o'zgartirish</b>\n\n"
@@ -1930,7 +2669,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "renvdel":
         service_id = parts[2]
-        context.user_data["dev_action"] = {"type": "render_env_delete", "service_id": service_id}
+        account = _render_account_for_service(context, service_id)
+        context.user_data["dev_action"] = {
+            "type": "render_env_delete",
+            "service_id": service_id,
+            "account_id": account["id"] if account else "",
+        }
         await _safe_edit_query(
             query,
             "🗑 <b>Environment variable o'chirish</b>\n\n"
@@ -1940,13 +2684,90 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return DEV_WAIT_TEXT
 
+    if action == "renvpdf":
+        service_id = parts[2]
+        await _safe_edit_query(query, "📄 <b>ENV PDF tayyorlanmoqda...</b>\nRender'dan barcha o'zgaruvchilar olinmoqda.", parse_mode="HTML")
+        try:
+            api_key = _render_api_key_for_service(context, service_id)
+            service = await render_api.get_service(api_key, service_id)
+            env_items = await render_api.list_env_vars_all(api_key, service_id)
+            if not env_items:
+                await _safe_edit_query(
+                    query, "ℹ️ Bu servisda environment variable yo'q — PDF qilinadigan narsa topilmadi.",
+                    reply_markup=_back_keyboard(f"dev:rsettings:{service_id}"), parse_mode="HTML",
+                )
+                return DEV_MENU
+            pdf_bytes, info = await asyncio.to_thread(render_env_pdf.build_env_pdf, service, env_items)
+            missing_note = (
+                f"\n⚠️ Qiymati berilmagani uchun tushib qolgan: {', '.join(info['missing'][:10])}"
+                if info["missing"] else ""
+            )
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=io.BytesIO(pdf_bytes),
+                filename=render_env_pdf.safe_filename(service),
+                caption=(
+                    f"🔐 {_render_service_name(service)} — ENV PDF\n"
+                    f"🧾 Jami: {info['count']} ta\n"
+                    "⚠️ Ichida MAXFIY kalitlar bor. Begonaga bermang, ishlatib bo'lgach Telegramdan o'chiring."
+                    f"{missing_note}"
+                )[:1000],
+            )
+            await _safe_edit_query(
+                query, "✅ <b>ENV PDF tayyor va yuborildi.</b>",
+                reply_markup=_back_keyboard(f"dev:rsettings:{service_id}"), parse_mode="HTML",
+            )
+        except Exception as exc:
+            await _render_api_error(query, exc, f"dev:rsettings:{service_id}")
+        return DEV_MENU
+
+    if action == "renvpdfup":
+        service_id = parts[2]
+        account = _render_account_for_service(context, service_id)
+        context.user_data["dev_action"] = {
+            "type": "render_env_pdf_import",
+            "service_id": service_id,
+            "account_id": account["id"] if account else "",
+        }
+        await _safe_edit_query(
+            query,
+            "📥 <b>ENV PDF yuklash</b>\n\n"
+            "«📄 ENV'larni PDF qilish» orqali olingan <b>PDF faylni</b> shu yerga yuboring.\n"
+            "PDF'dagi barcha environment variable'lar shu servisga o'rnatiladi "
+            "(mavjud bo'lsa qiymati almashtiriladi; PDF'da yo'q o'zgaruvchilar o'chirilmaydi).\n\n"
+            "Xavfsizlik uchun yuborilgan PDF xabari chatdan o'chiriladi.",
+            reply_markup=_back_keyboard(f"dev:rsettings:{service_id}"), parse_mode="HTML",
+        )
+        return DEV_WAIT_ENVPDF
+
+    if action == "renvpdfgo":
+        service_id, mode = parts[2], (parts[3] if len(parts) > 3 else "all")
+        pending = context.user_data.pop("env_pdf_pending", None)
+        if not pending or pending.get("service_id") != service_id:
+            await _safe_edit_query(
+                query, "⚠️ Kutilayotgan import topilmadi. PDF'ni qaytadan yuklang.",
+                reply_markup=_back_keyboard(f"dev:rsettings:{service_id}"), parse_mode="HTML",
+            )
+            return DEV_MENU
+        entries = pending["entries"]
+        skipped_creds: list[str] = []
+        if mode == "skip":
+            skipped_creds = render_env_pdf.render_credential_keys(entries)
+            entries = [(k, v) for k, v in entries if k not in set(skipped_creds)]
+        await _apply_env_import(
+            context, service_id, pending.get("account_id", ""), entries,
+            pending.get("invalid", []), skipped_creds,
+        )
+        return DEV_MENU
+
     if action == "rautodeploy":
         service_id, value = parts[2], parts[3]
         await _safe_edit_query(query, "⚙️ Auto Deploy sozlanmoqda...", parse_mode="HTML")
         try:
-            await render_api.update_service(service_id, {"autoDeploy": value})
-            service = await render_api.get_service(service_id)
-            env_vars = await render_api.list_env_vars(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            await render_api.update_service(api_key, service_id, {"autoDeploy": value})
+            service = await render_api.get_service(api_key, service_id)
+            env_vars = await render_api.list_env_vars(api_key, service_id)
             await _safe_edit_query(
                 query, "✅ <b>Auto Deploy yangilandi.</b>\n\n" + _render_settings_text(service, env_vars),
                 reply_markup=_render_settings_keyboard(service), parse_mode="HTML",
@@ -1959,8 +2780,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "📋 Deploylar olinmoqda...", parse_mode="HTML")
         try:
-            service = await render_api.get_service(service_id)
-            deploys = await render_api.list_deploys(service_id, limit=30)
+            api_key = _render_api_key_for_service(context, service_id)
+            service = await render_api.get_service(api_key, service_id)
+            deploys = await render_api.list_deploys(api_key, service_id, limit=30)
             await _safe_edit_query(
                 query, _render_deploys_text(service, deploys),
                 reply_markup=_render_deploy_keyboard(service_id, deploys), parse_mode="HTML",
@@ -1976,12 +2798,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             category = "all"
         await _safe_edit_query(query, f"☁️ {_RENDER_LEVEL_LABELS[category]} olinmoqda...", parse_mode="HTML")
         try:
-            service = await render_api.get_service(service_id)
-            latest_deploy_raw = await _latest_render_deploy_start(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            account = _render_account_for_service(context, service_id)
+            service = await render_api.get_service(api_key, service_id)
+            latest_deploy_raw = await _latest_render_deploy_start(api_key, service_id)
             latest_deploy = render_api._parse_dt(latest_deploy_raw) if latest_deploy_raw else None
             logs = await render_api.list_logs_for_service(
+                api_key=api_key,
                 service_id=service_id,
-                owner_id=str(service.get("ownerId") or service.get("owner_id") or config.RENDER_OWNER_ID or ""),
+                owner_id=str(service.get("ownerId") or service.get("owner_id") or (account.get("owner_id") if account else "") or ""),
                 levels=_RENDER_LEVEL_FILTERS[category],
                 limit=100,
                 start_time=latest_deploy,
@@ -1998,12 +2823,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_id = parts[2]
         await _safe_edit_query(query, "📄 <b>PDF tayyorlanmoqda...</b>\nRender'dan mavjud loglar olinmoqda, biroz kuting.", parse_mode="HTML")
         try:
-            service = await render_api.get_service(service_id)
-            owner_id = str(service.get("ownerId") or service.get("owner_id") or config.RENDER_OWNER_ID or "")
-            latest_deploy_raw = await _latest_render_deploy_start(service_id)
+            api_key = _render_api_key_for_service(context, service_id)
+            account = _render_account_for_service(context, service_id)
+            service = await render_api.get_service(api_key, service_id)
+            owner_id = str(service.get("ownerId") or service.get("owner_id") or (account.get("owner_id") if account else "") or "")
+            latest_deploy_raw = await _latest_render_deploy_start(api_key, service_id)
             latest_deploy = render_api._parse_dt(latest_deploy_raw) if latest_deploy_raw else None
             logs = await render_api.list_logs_for_service(
-                service_id=service_id, owner_id=owner_id, levels=None, limit=5000,
+                api_key=api_key, service_id=service_id, owner_id=owner_id, levels=None, limit=5000,
                 hours=config.RENDER_LOG_PDF_HOURS, start_time=latest_deploy,
             )
             pdf_path = render_api.create_logs_pdf(service, logs)
@@ -2150,10 +2977,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             from handlers import wallet_ui
             payment = wallet.get_payment(payment_id)
-            if payment:
+            if payment and sub_action in ("approve", "reject"):
                 await wallet_ui.notify_user_payment_decision(
                     context.bot, payment, approved=(sub_action == "approve"),
                     reason="" if sub_action == "approve" else "Admin tomonidan rad etildi.",
+                )
+            elif payment and sub_action == "revoke":
+                new_balance = wallet.get_balance(payment["user_id"])
+                await wallet_ui.notify_user_payment_revoked(
+                    context.bot, payment, new_balance, reason="Admin tomonidan soxta deb topildi.",
                 )
         await _safe_edit_query(
             query, f"{message}\n\n" + pay_ui.payment_detail_text(payment_id),
@@ -2259,6 +3091,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action_type is None:
         return DEV_MENU
+
+    if str(action_type).startswith("ads_"):
+        from handlers import ads as ads_ui
+        return await ads_ui.handle_dev_text(action, update, context, DEV_MENU, DEV_WAIT_TEXT)
 
     if action_type == "github_new_path":
         # Path is intentionally accepted separately from content to support
@@ -2380,7 +3216,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ KEY nomi noto'g'ri. Faqat harf, raqam va _ ishlating; raqam bilan boshlamang.")
             return DEV_WAIT_TEXT
         try:
-            await render_api.upsert_env_var(service_id, key, value)
+            account = config.get_render_account(action.get("account_id", "")) or _render_account_for_service(context, service_id)
+            if not account:
+                raise render_api.RenderAPIError(401, "Render API kaliti sozlanmagan (RENDER_API_KEY).")
+            await render_api.upsert_env_var(account["key"], service_id, key, value)
             await update.message.reply_text(
                 f"✅ <code>{_esc(key)}</code> Render Environment Variables'ga saqlandi.\n"
                 "Qiymat xavfsizlik sababli ko'rsatilmaydi. Deploy qilish uchun RENDER → 🚀 Deploy ni bosing.",
@@ -2399,7 +3238,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ KEY nomi noto'g'ri.")
             return DEV_WAIT_TEXT
         try:
-            await render_api.delete_env_var(service_id, key)
+            account = config.get_render_account(action.get("account_id", "")) or _render_account_for_service(context, service_id)
+            if not account:
+                raise render_api.RenderAPIError(401, "Render API kaliti sozlanmagan (RENDER_API_KEY).")
+            await render_api.delete_env_var(account["key"], service_id, key)
             await update.message.reply_text(f"✅ <code>{_esc(key)}</code> o'chirildi. Deploy qilish kerak bo'lishi mumkin.", parse_mode="HTML")
         except Exception as exc:
             await update.message.reply_text("❌ " + _esc(render_api.human_error(exc)), parse_mode="HTML")
@@ -2416,9 +3258,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _func_menu_keyboard(prefix),
         )
 
+    elif action_type == "add_key_model":
+        provider = action["provider"]
+        model = image_clients.normalize_model(provider, raw_value)
+        pending = context.user_data.get("dev_pending_img_key") or {}
+        if not model:
+            await _edit_menu(
+                context, "⚠️ Model nomi noto'g'ri (faqat lotin harf, raqam, '.', '-', '_'). Qaytadan yuboring:",
+                _back_keyboard("dev:keyadd"))
+            context.user_data["dev_action"] = action
+            return DEV_WAIT_TEXT
+        if pending.get("provider") != provider or not pending.get("key"):
+            await _edit_menu(context, "⚠️ Kalit topilmadi — kalitni qaytadan qo'shing.\n\n" + _keys_menu_text(), _keys_menu_keyboard())
+        else:
+            context.user_data.pop("dev_pending_img_key", None)
+            idx = config.add_key(provider, pending["key"], model)
+            await _edit_menu(
+                context,
+                f"✅ {_esc(_provider_label(provider))} kalit #{idx} qo'shildi (model: <code>{_esc(model)}</code>).\n\n"
+                + _keys_menu_text(), _keys_menu_keyboard())
+
     elif action_type == "key_field":
         provider, idx, field = action["provider"], action["index"], action["field"]
         value = "" if raw_value in ("-", "bosh", "bo'sh") else raw_value
+        if provider in config.IMAGE_PROVIDERS and field == "model":
+            value = image_clients.normalize_model(provider, value)
+            if not value:
+                await _edit_menu(
+                    context, "⚠️ Model nomi noto'g'ri (faqat lotin harf, raqam, '.', '-', '_'). Qaytadan yuboring:",
+                    _back_keyboard(f"dev:keyview:{provider}:{idx}"))
+                context.user_data["dev_action"] = action
+                return DEV_WAIT_TEXT
         config.update_key_field(provider, idx, field, value)
         field_label = "Kalit" if field == "key" else "Model"
         await _edit_menu(
@@ -2432,6 +3302,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not raw_value:
             context.user_data.pop("dev_action", None)
             return DEV_MENU
+        if provider in config.IMAGE_PROVIDERS:
+            # Kalit XOTIRADA (user_data) saqlanadi, model tanlangandan keyingina
+            # KEY_POOLS ga yoziladi. Kalit chatdan allaqachon o'chirilgan.
+            context.user_data["dev_pending_img_key"] = {"provider": provider, "key": raw_value}
+            await _edit_menu(
+                context,
+                _img_model_picker_text(provider, f"✅ <b>{_esc(_provider_label(provider))}</b> kaliti qabul qilindi. Endi modelni tanlang:"),
+                _img_model_picker_keyboard(provider, f"dev:imgadd:{provider}", f"dev:imgaddmanual:{provider}", "dev:keyadd"),
+            )
+            context.user_data.pop("dev_action", None)
+            return DEV_MENU
         default_model = config.DEFAULT_MODEL_BY_PROVIDER.get(provider, "")
         idx = config.add_key(provider, raw_value, default_model)
         await _edit_menu(
@@ -2442,6 +3323,110 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + _keys_menu_text(),
             _keys_menu_keyboard(),
         )
+
+    elif action_type == "gift_target":
+        target = raw_value.strip()
+        # "all" endi matn orqali emas, tugma orqali tanlanadi.
+        if target.casefold() == "all":
+            await _edit_menu(
+                context,
+                "⚠️ <code>all</code> matn sifatida qabul qilinmaydi. "
+                "Sovg'a oynasidagi <b>👥 Hammasi</b> tugmasini bosing.",
+                pay_ui.gift_target_keyboard(),
+                parse_mode="HTML",
+            )
+            context.user_data["dev_action"] = {"type": "gift_target"}
+            return DEV_MENU
+        if not target.isdigit() or int(target) <= 0:
+            await _edit_menu(
+                context,
+                "⚠️ Telegram ID noto'g'ri. Raqamli ID yoki <code>all</code> yuboring.\n\n"
+                + pay_ui.gift_prompt_text(),
+                _back_keyboard("dev:moliya"),
+            )
+            context.user_data["dev_action"] = action
+            return DEV_WAIT_TEXT
+        if target != "all":
+            target = str(int(target))
+        count = len(storage.get_all_users()) if target == "all" else None
+        context.user_data["dev_action"] = {"type": "gift_amount", "target": target}
+        await _edit_menu(
+            context,
+            pay_ui.gift_amount_prompt(target),
+            _back_keyboard("dev:moliya"),
+            parse_mode="HTML",
+        )
+        return DEV_WAIT_TEXT
+
+    elif action_type == "gift_amount":
+        if not raw_value.isdigit() or int(raw_value) <= 0:
+            await _edit_menu(
+                context,
+                "⚠️ Summa 0 dan katta bo'lgan butun son bo'lishi kerak. Masalan: <code>10000</code>.",
+                _back_keyboard("dev:moliya"),
+            )
+            context.user_data["dev_action"] = action
+            return DEV_WAIT_TEXT
+        amount = int(raw_value)
+        target = action["target"]
+        if target == "all" and not storage.get_all_users():
+            await _edit_menu(
+                context, "⚠️ Hozircha botdan foydalangan foydalanuvchi topilmadi.",
+                _moliya_menu_keyboard(),
+            )
+            context.user_data.pop("dev_action", None)
+            return DEV_MENU
+        count = len(storage.get_all_users()) if target == "all" else None
+        context.user_data["dev_action"] = {
+            "type": "gift_confirm", "target": target, "amount": amount,
+            "mode": action.get("mode", "add"),
+        }
+        await _edit_menu(
+            context,
+            pay_ui.gift_confirm_text(target, amount, count, action.get("mode", "add")),
+            pay_ui.gift_confirm_keyboard(),
+            parse_mode="HTML",
+        )
+        return DEV_MENU
+
+    elif action_type == "user_topup":
+        if not raw_value.isdigit() or int(raw_value) <= 0:
+            user_id = int(action["user_id"])
+            await _edit_menu(
+                context,
+                "⚠️ Summa 0 dan katta bo'lgan butun son bo'lishi kerak. Masalan: <code>10000</code>.\n\n"
+                + pay_ui.user_topup_prompt(user_id),
+                _back_keyboard(f"dev:user:{user_id}"),
+            )
+            context.user_data["dev_action"] = action
+            return DEV_WAIT_TEXT
+        user_id = int(action["user_id"])
+        amount = int(raw_value)
+        try:
+            tx = await asyncio.to_thread(
+                wallet.credit_balance,
+                user_id, amount,
+                f"Admin tomonidan hisob to'ldirildi: {pay_ui._fmt_sum(amount)}",
+                wallet.TX_ADMIN_ADJUST,
+                None,
+                update.effective_user.id,
+            )
+            context.user_data.pop("dev_action", None)
+            await _edit_menu(
+                context,
+                "✅ <b>Hisob to'ldirildi.</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"➕ Qo'shildi: <b>{pay_ui._fmt_sum(amount)}</b>\n"
+                f"💳 Yangi balans: <b>{pay_ui._fmt_sum(tx['balance_after'])}</b>",
+                pay_ui.user_detail_keyboard(user_id),
+            )
+        except Exception as exc:
+            context.user_data["dev_action"] = action
+            await _edit_menu(
+                context, f"❌ Hisob to'ldirishda xato: {_esc(str(exc))}",
+                _back_keyboard(f"dev:user:{user_id}"),
+            )
+            return DEV_WAIT_TEXT
 
     elif action_type == "feature_price":
         feature_id = action["feature_id"]
@@ -2633,6 +3618,159 @@ async def on_github_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return DEV_WAIT_GITHUB
 
 
+_ENV_PDF_MAX_BYTES = 10 * 1024 * 1024
+
+
+async def _apply_env_import(
+    context: ContextTypes.DEFAULT_TYPE,
+    service_id: str,
+    account_id: str,
+    entries: list[tuple[str, str]],
+    invalid_keys: list[str],
+    skipped_creds: list[str] | None = None,
+):
+    """PDF'dan olingan ENV'larni Render servisiga ketma-ket o'rnatadi.
+
+    Qiymatlar hech qayerda ko'rsatilmaydi va logga yozilmaydi.
+    """
+    skipped_creds = skipped_creds or []
+    back = _back_keyboard(f"dev:rsettings:{service_id}")
+    account = config.get_render_account(account_id) or _render_account_for_service(context, service_id)
+    if not account:
+        await _edit_menu(context, "❌ Render API kaliti sozlanmagan (RENDER_API_KEY).", back)
+        return
+
+    ok = 0
+    failed: list[tuple[str, str]] = []
+    aborted = False
+    total = len(entries)
+    for i, (key, value) in enumerate(entries, 1):
+        try:
+            await render_api.upsert_env_var(account["key"], service_id, key, value)
+            ok += 1
+        except Exception as exc:
+            failed.append((key, render_api.human_error(exc)))
+            # Kalit/ruxsat/servis xatosi qolgan hammasiga ham tegishli — to'xtatamiz.
+            if isinstance(exc, render_api.RenderAPIError) and exc.status_code in (401, 403, 404):
+                aborted = True
+                break
+        if i % 5 == 0 and i < total:
+            try:
+                await _edit_menu(context, f"📥 <b>ENV'lar o'rnatilmoqda...</b> {i}/{total}", back)
+            except Exception:
+                pass
+
+    lines = [
+        ("⚠️" if failed else "✅") + f" <b>ENV PDF import tugadi:</b> {ok}/{total} ta o'rnatildi.",
+    ]
+    if failed:
+        lines.append("\n❌ <b>O'rnatilmadi:</b>")
+        for key, reason in failed[:15]:
+            lines.append(f"• <code>{_esc(key)}</code> — {_esc(reason)}")
+        if len(failed) > 15:
+            lines.append(f"• … yana {len(failed) - 15} ta")
+        if aborted:
+            lines.append("<i>Xato hamma o'zgaruvchiga tegishli bo'lgani uchun jarayon to'xtatildi.</i>")
+    if skipped_creds:
+        lines.append("\n⏭ O'tkazib yuborildi (Render ulanish kalitlari): " + ", ".join(f"<code>{_esc(k)}</code>" for k in skipped_creds))
+    if invalid_keys:
+        lines.append("\n⏭ Noto'g'ri nomli, o'tkazib yuborildi: " + ", ".join(f"<code>{_esc(k)}</code>" for k in invalid_keys[:10]))
+    if ok:
+        lines.append("\nO'zgarishlar kuchga kirishi uchun 🚀 Deploy qiling.")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Deploy", callback_data=f"dev:rdeploy:{service_id}")],
+        [InlineKeyboardButton("⚙️ Sozlamalar", callback_data=f"dev:rsettings:{service_id}")],
+    ])
+    await _edit_menu(context, "\n".join(lines)[:3900], keyboard)
+
+
+async def on_env_pdf_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin yuborgan ENV PDF'ni o'qib, shu servisga o'rnatadi."""
+    if not _is_admin(update) or not update.message:
+        return ConversationHandler.END
+    action = context.user_data.get("dev_action") or {}
+    if action.get("type") != "render_env_pdf_import":
+        return DEV_MENU
+    service_id = str(action.get("service_id") or "")
+    back = _back_keyboard(f"dev:rsettings:{service_id}")
+
+    if "dev_msg" not in context.user_data:
+        msg = await update.message.reply_text("⏳ Amal bajarilmoqda...")
+        context.user_data["dev_msg"] = (msg.chat_id, msg.message_id)
+
+    async def _drop_user_message():
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    doc = update.message.document
+    is_pdf = bool(doc) and (
+        (doc.file_name or "").lower().endswith(".pdf") or (doc.mime_type or "").lower() == "application/pdf"
+    )
+    if not is_pdf:
+        await _drop_user_message()
+        await _edit_menu(context, "⚠️ Iltimos, «ENV'larni PDF qilish» orqali olingan <b>.pdf</b> faylni yuboring.", back)
+        return DEV_WAIT_ENVPDF
+    if doc.file_size and doc.file_size > _ENV_PDF_MAX_BYTES:
+        await _drop_user_message()
+        await _edit_menu(context, "⚠️ PDF juda katta (10 MB dan oshmasligi kerak).", back)
+        return DEV_WAIT_ENVPDF
+
+    try:
+        tg_file = await doc.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+    except Exception as exc:
+        await _edit_menu(context, f"❌ PDF'ni yuklab bo'lmadi: {_esc(exc)}", back)
+        return DEV_WAIT_ENVPDF
+    await _drop_user_message()  # ichida maxfiy kalitlar bor — chatda qolmasin
+
+    try:
+        payload = await asyncio.to_thread(render_env_pdf.parse_env_pdf, data)
+    except render_env_pdf.EnvPdfError as exc:
+        await _edit_menu(context, f"❌ {_esc(exc)}", back)
+        return DEV_WAIT_ENVPDF
+    except Exception as exc:
+        logger.error("ENV PDF o'qishda kutilmagan xato: %s", type(exc).__name__)
+        await _edit_menu(context, "❌ PDF'ni o'qishda kutilmagan xato yuz berdi.", back)
+        return DEV_WAIT_ENVPDF
+
+    entries, invalid = render_env_pdf.split_valid(payload["vars"])
+    if not entries:
+        await _edit_menu(context, "⚠️ PDF'da o'rnatiladigan o'zgaruvchi topilmadi.", back)
+        return DEV_WAIT_ENVPDF
+
+    context.user_data.pop("dev_action", None)
+    creds = render_env_pdf.render_credential_keys(entries)
+    if creds:
+        # Boshqa Render hisobiga ko'chirishda eski RENDER_API_KEY yangisining
+        # ustiga yozilsa, panel noto'g'ri hisobni boshqarib qoladi — so'raymiz.
+        context.user_data["env_pdf_pending"] = {
+            "service_id": service_id,
+            "account_id": action.get("account_id", ""),
+            "entries": entries,
+            "invalid": invalid,
+        }
+        await _edit_menu(
+            context,
+            f"📥 PDF o'qildi: <b>{len(entries)}</b> ta o'zgaruvchi.\n\n"
+            "⚠️ PDF'da Render ulanish kalitlari bor:\n"
+            + "\n".join(f"• <code>{_esc(k)}</code>" for k in creds[:10])
+            + "\n\nAgar loyihani <b>boshqa Render hisobiga</b> ko'chirayotgan bo'lsangiz, bularni o'rnatsangiz "
+            "yangi servis eski hisobni boshqarib qoladi. Qanday davom etamiz?",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Hammasini o'rnatish", callback_data=f"dev:renvpdfgo:{service_id}:all")],
+                [InlineKeyboardButton("⏭ RENDER_* kalitlarsiz o'rnatish", callback_data=f"dev:renvpdfgo:{service_id}:skip")],
+                [InlineKeyboardButton("⬅️ Bekor qilish", callback_data=f"dev:rsettings:{service_id}")],
+            ]),
+        )
+        return DEV_MENU
+
+    await _edit_menu(context, f"📥 <b>ENV'lar o'rnatilmoqda...</b> 0/{len(entries)}", back)
+    await _apply_env_import(context, service_id, action.get("account_id", ""), entries, invalid)
+    return DEV_MENU
+
+
 async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update) or not update.message:
         return ConversationHandler.END
@@ -2687,6 +3825,13 @@ async def on_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action_type == "bulk_pool_model":
         provider, scope = action["provider"], action["scope"]
+        if provider in config.IMAGE_PROVIDERS:
+            model = image_clients.normalize_model(provider, model)
+            if not model:
+                await _edit_menu(
+                    context, "⚠️ Model nomi noto'g'ri. Qaytadan yuboring:",
+                    _back_keyboard(f"dev:keybulkprov:{provider}"))
+                return DEV_WAIT_BULK_MODEL
         updated = config.bulk_update_pool_models(provider, scope, model)
         scope_label = _SCOPE_LABELS.get(scope, scope)
         if updated:

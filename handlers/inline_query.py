@@ -87,6 +87,7 @@ MUHIM SOZLASH (config.py / .env orqali):
 """
 
 import asyncio
+import html
 import io
 import logging
 import re
@@ -100,6 +101,7 @@ from telegram import (
     InlineQueryResultArticle,
     InlineQueryResultAudio,
     InlineQueryResultDocument,
+    InlineQueryResultPhoto,
     InlineQueryResultsButton,
     WebAppInfo,
     InputTextMessageContent,
@@ -116,6 +118,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.helpers import escape_markdown
 
+import ai_draw
 import config
 from config import UNIVERSAL_CHAT_AI, PUBLIC_BASE_URL
 from ai_clients import ask_ai
@@ -132,6 +135,7 @@ import inline_media
 import webapp_security
 import movie_watch
 import game
+import chat_games
 import drawing_game
 
 logger = logging.getLogger(__name__)
@@ -249,13 +253,17 @@ TABRIK_BARE_RE = re.compile(r"^/tabrik(?:@\w+)?\s*$", re.IGNORECASE)
 KINO_RE = re.compile(r"^kino(?:\s+(.+))?$", re.IGNORECASE)
 # 🎮 GAME — 1v1 shaxmat / rus shashkasi. "@Student_ai_uz_bot game"
 # yozilganda aynan shu ikki o'yin ro'yxati chiqadi.
-GAME_RE = re.compile(r"^game$", re.IGNORECASE)
+# "@Bot game" — barcha o'yinlar; "@Bot quoridor" (yoki kvoridor/koridor) — faqat Quoridor.
+GAME_RE = re.compile(r"^(?:game|games|o['’‘`ʻ]?yin(?:lar)?)$", re.IGNORECASE)
+QUORIDOR_RE = re.compile(r"^(?:quoridor|kvoridor|koridor|kuoridor|quorridor)$", re.IGNORECASE)
 
 # 🎨 /rasim — ATAYLAB bo'sh query'ni ham qabul qiladi: do'st bilan chatda
 # shunchaki "@Student_ai_uz_bot" deb yozib to'xtash eng qulay/tabiiy
 # harakat (bo'sh inline so'rovning boshqa mazmunli natijasi yo'q — AI
 # chatga bo'sh matn yuborish foydasiz), shuning uchun buni ham "rasm
 # chizish" tugmasiga yo'naltiramiz. Aniq "/rasim" ham bir xil ishlaydi.
+# 🎨 "@Bot rasm <tavsif>" — AI rasm chizdirish (pullik, har bir rasm uchun admin narxi).
+IMAGE_INLINE_RE = re.compile(r"^(?:rasm|rasim|surat)\s*[:\-]?\s*(.*)$", re.IGNORECASE | re.DOTALL)
 RASIM_RE = re.compile(r"^$|^/rasim(?:@\w+)?\s*$", re.IGNORECASE)
 
 # 💎 /pro — /tabrik'ning shaxsiy-rasmli versiyasi (qarang: handlers/pro_tabrik.py)
@@ -282,6 +290,15 @@ async def on_inline_query(
         await managed_tests.on_inline(update, context)
         return
 
+    # 📢 Reklama: /developer > 📢 Reklama akkaunt (Telethon) nomidan guruhga yuborayotganda
+    # "@Bot ad:<id>" inline natijasini tanlaydi — shu tufayli xabar ostida botga o'tish
+    # tugmasi bo'ladi (oddiy user akkaunt tugma qo'sha olmaydi). Boshqa hech qanday
+    # oqimga (AI va h.k.) tushmaydi.
+    if _raw_q.lower().startswith("ad:"):
+        from handlers import ads as ads_ui
+        await ads_ui.on_inline_ad_query(update, context)
+        return
+
     query = update.inline_query.query.strip()
     user = update.inline_query.from_user
     logger.info("🔍 INLINE START: user_id=%s username=%s query=%r", getattr(user, "id", "?"), _user_label(user), query)
@@ -295,6 +312,43 @@ async def on_inline_query(
 
     if RASIM_RE.match(query):
         await _answer_rasim(update)
+        return
+
+    # 🏛 Shaxsiy Xotiralar muzeyini inline ulashish: @Student_ai_uz_bot muzey
+    if re.fullmatch(r"muzey", query, re.IGNORECASE):
+        try:
+            import museum as museum_service
+            conn = museum_service._db()
+            row = conn.execute('SELECT id,title FROM museums WHERE owner_id=? ORDER BY created DESC LIMIT 1', (int(user.id),)).fetchone()
+            invite_token = None
+            if row:
+                import secrets, time as _time
+                invite_token = secrets.token_hex(32)
+                conn.execute('INSERT INTO invites(token,museum_id,created,expires) VALUES(?,?,?,?)', (invite_token, row['id'], _time.time(), _time.time()+24*3600))
+                conn.commit()
+            conn.close()
+            if row:
+                deep_link = f"https://t.me/Student_ai_uz_bot?startapp=museum_{row['id']}_{invite_token}"
+                result = InlineQueryResultArticle(
+                    id=f"museum_{row['id']}",
+                    title=f"🏛 {row['title']}",
+                    description="Shaxsiy Xotiralar muzeyini ulashish",
+                    input_message_content=InputTextMessageContent(
+                        f"🏛 {row['title']}\n\nMening Xotiralar muzeyimga sayohat qiling: {deep_link}"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏛 Muzeyga kirish", url=deep_link)]])
+                )
+                await update.inline_query.answer([result], cache_time=0, is_personal=True)
+            else:
+                result = InlineQueryResultArticle(
+                    id=f"museum-none-{user.id}", title="🏛 Avval shaxsiy muzey yarating",
+                    description="/muzey buyrug‘i orqali muzey oching",
+                    input_message_content=InputTextMessageContent("🏛 Shaxsiy muzeyimni hali yaratmadim. Men ham /muzey orqali yarataman.")
+                )
+                await update.inline_query.answer([result], cache_time=0, is_personal=True)
+        except Exception as exc:
+            logger.exception("Museum inline query failed: %s", type(exc).__name__)
+            await update.inline_query.answer([], cache_time=0, is_personal=True)
         return
 
     if not query:
@@ -346,32 +400,90 @@ async def on_inline_query(
     # yaratilgan bo'ladi; tugma shu xonani Direct Mini App sifatida ochadi.
     # Server barcha yurishlarni qayta tekshiradi.
     # --------------------------------------------------------
-    if GAME_RE.match(query):
-        if not PUBLIC_BASE_URL:
-            await _answer_redirect(update, query, "PUBLIC_BASE_URL sozlanmagan — O'yin Mini App ochilmaydi")
-            return
+    if GAME_RE.match(query) or QUORIDOR_RE.match(query):
+        # Shashka va X-O Telegram chatining o'zida ishlaydi.
+        # Faqat Shaxmat uchun Mini App URL kerak bo'lishi mumkin.
         results=[]
+        _only_quoridor = bool(QUORIDOR_RE.match(query))
         for gkey,title,desc,emoji in [
             ("chess","♟ Shaxmat","2 kishi • oq/qora • klassik yurish qoidalari","♟"),
             ("checkers","⚪ Rus shashkasi","2 kishi • majburiy urish • damka","⚪"),
+            ("memory","🧠 Xotira o'yini","2 kishi • juftlik topish • katak/belgi tanlanadi","🧠"),
+            ("tictactoe","❌⭕ X-O o'yini","2 kishi • 3x3 • qator/ustun/diagonal","❌"),
+            ("quoridor","🧱 Quoridor","2 kishi • yo‘l topish • 10 ta devor","🧱"),
         ]:
+            if _only_quoridor and gkey != "quoridor":
+                continue
             rid=game.create_room(gkey,user.id)
             if not rid:
                 continue
-            url=game.room_url(gkey,rid)
-            results.append(InlineQueryResultArticle(
-                id=f"game_{gkey}_{uuid.uuid4().hex}",
-                title=title,
-                description=desc,
-                input_message_content=InputTextMessageContent(
-                    f"{emoji} {title}\n\n"
-                    "👥 1v1 o'yin xonasi tayyor.\n"
-                    "👇 Ikkalangiz ham tugmani bosib Mini App'ga kiring va rang tanlang."
-                ),
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🎮 O‘yinni boshlash", url=url)
-                ]]),
-            ))
+            if gkey == "quoridor":
+                # Birinchi o'yinchining ismi/@username'i doskada ko'rinishi uchun.
+                chat_games.q_set_profile(game.ROOMS.get(rid) or {}, user)
+            if gkey == "quoridor":
+                # 🧱 Quoridor — TELEGRAM MINI APP rejimida (Shaxmat kabi): natija chatga
+                # tushgach "🎮 O'ynash" tugmasi xonani Direct Mini App sifatida ochadi.
+                # Ikkinchi o'yinchi ham shu xabardagi tugma orqali kiradi va o'yin boshlanadi.
+                # Havola uchun HAQIQIY bot username (context.bot) ishlatiladi; PUBLIC_BASE_URL
+                # bo'lmasa ham natija chiqadi (Direct Mini App havolasi t.me orqali ishlaydi).
+                _bun = getattr(getattr(context, "bot", None), "username", None)
+                game.set_bot_username(_bun)
+                url = game.room_url(gkey, rid, _bun)
+                _p1 = (user.username and "@" + user.username) or user.full_name or "o‘yinchi"
+                _qtext = (f"🧱 <b>QUORIDOR</b> 🏆\n\n"
+                          f"🔵 1-o‘yinchi: {html.escape(str(_p1))}\n"
+                          f"🔴 2-o‘yinchi: kutilmoqda…\n\n"
+                          "9×9 doska • har kimda 10 ta devor • birinchi bo‘lib qarshi qatorga yetgan g‘olib.\n"
+                          "👇 Tugmani bosib Mini App’da o‘ynang. Do‘stingiz ham shu xabardagi tugma orqali qo‘shiladi.\n"
+                          "Agar Mini App ochilmasa — pastdagi “🤖 Bot orqali ochish” tugmasini bosing.")
+                _qkb = [[InlineKeyboardButton("🎮 Quoridor o‘ynash", url=url)],
+                        [InlineKeyboardButton("🤖 Bot orqali ochish (zaxira)", url=game.start_url(rid, _bun))]]
+                results.append(InlineQueryResultArticle(
+                    id=f"game_{gkey}_{uuid.uuid4().hex}", title=title, description=desc,
+                    input_message_content=InputTextMessageContent(_qtext, parse_mode="HTML"),
+                    reply_markup=InlineKeyboardMarkup(_qkb),
+                ))
+                continue
+            if gkey in ("checkers", "tictactoe", "memory"):
+                if gkey == "checkers":
+                    kb = [[InlineKeyboardButton("⚪ Oq", callback_data=f"cg:side:{rid}:w"), InlineKeyboardButton("⚫ Qora", callback_data=f"cg:side:{rid}:b")], [InlineKeyboardButton("👥 Qo‘shilish", callback_data=f"cg:join:{rid}")]]
+                    text = ("⚪ <b>Rus shashkasi</b>\n\n"
+                            "👥 1v1 o‘yin chatning o‘zida.\n"
+                            "Har bir yurish shu xabardagi tugmalar orqali qilinadi.\n"
+                            "Avval rangni tanlang, sherigingiz qo‘shilsin.")
+                elif gkey == "tictactoe":
+                    kb = [[InlineKeyboardButton("❌ X", callback_data=f"cg:mark:{rid}:x"), InlineKeyboardButton("⭕ O", callback_data=f"cg:mark:{rid}:o")], [InlineKeyboardButton("👥 Qo‘shilish", callback_data=f"cg:join:{rid}")]]
+                    text = ("❌⭕ <b>X-O o‘yini</b>\n\n"
+                            "👥 1v1 o‘yin chatning o‘zida.\n"
+                            "Har bir yurish shu xabardagi tugmalar orqali qilinadi.\n"
+                            "Avval belgini tanlang, sherigingiz qo‘shilsin.")
+                else:
+                    kb = [[InlineKeyboardButton("👤 2 kishilik", callback_data=f"cg:mmode:{rid}:duel"),
+                           InlineKeyboardButton("👥 Guruh bo‘lib", callback_data=f"cg:mmode:{rid}:teams")],
+                          [InlineKeyboardButton("4×4", callback_data=f"cg:msize:{rid}:4x4"), InlineKeyboardButton("4×6", callback_data=f"cg:msize:{rid}:4x6"), InlineKeyboardButton("6×6", callback_data=f"cg:msize:{rid}:6x6")],
+                          [InlineKeyboardButton("🍒 Mevalar", callback_data=f"cg:msym:{rid}:fruits"), InlineKeyboardButton("🔢 Raqamlar", callback_data=f"cg:msym:{rid}:numbers"), InlineKeyboardButton("🙃 Emoji", callback_data=f"cg:msym:{rid}:faces")],
+                          [InlineKeyboardButton("🐇 Hayvonlar", callback_data=f"cg:msym:{rid}:animals"), InlineKeyboardButton("🚀 Kosmos", callback_data=f"cg:msym:{rid}:space"), InlineKeyboardButton("⚽ Sport", callback_data=f"cg:msym:{rid}:sports")],
+                          [InlineKeyboardButton("👥 Qo‘shilish", callback_data=f"cg:join:{rid}")]]
+                    text = ("🧠 <b>Aqil charxi</b>\n\n"
+                            "O‘yin Telegram chatining o‘zida, Mini App’siz ishlaydi.\n"
+                            "Avval 2 kishilik yoki guruh rejimini tanlang, katak va emoji turini sozlang, keyin <b>▶️ Boshlash</b> tugmasini bosing.")
+                results.append(InlineQueryResultArticle(
+                    id=f"game_{gkey}_{uuid.uuid4().hex}", title=title, description=desc,
+                    input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+                    reply_markup=InlineKeyboardMarkup(kb),
+                ))
+            else:
+                # Shaxmat hozircha Mini App rejimida qoladi.
+                if not PUBLIC_BASE_URL:
+                    continue
+                url=game.room_url(gkey,rid)
+                results.append(InlineQueryResultArticle(
+                    id=f"game_{gkey}_{uuid.uuid4().hex}", title=title, description=desc,
+                    input_message_content=InputTextMessageContent(
+                        f"{emoji} {title}\n\n👥 1v1 o'yin xonasi tayyor.\n👇 Ikkalangiz ham tugmani bosib Mini App'ga kiring va rang tanlang."
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 O‘yinni boshlash", url=url)]]),
+                ))
         if not results:
             await _answer_instruction(update,"🎮 O'yin hozircha mavjud emas","Server sozlamasini tekshiring.",query=query)
             return
@@ -423,6 +535,13 @@ async def on_inline_query(
                     ]]),
                 )
             )
+        if not results:
+            # Barcha xonalar yaratilmadi (faol xonalar limiti) — bo'sh ro'yxat o'rniga sababini ko'rsatamiz.
+            await _answer_instruction(
+                update, "🎬 Xonalar band",
+                "Hozir faol xonalar juda ko'p. Birozdan keyin qayta urinib ko'ring.", query=query,
+            )
+            return
         await update.inline_query.answer(results, cache_time=3, is_personal=True)
         _log_inline(user, query, "queued", f"/kino katalog natijalari={len(results)}")
         return
@@ -671,6 +790,39 @@ async def on_inline_query(
         return
 
     # --------------------------------------------------------
+    # 🎨 AI RASM CHIZDIRISH: "rasm quyosh botayotgan dengiz"
+    # --------------------------------------------------------
+    m_img = IMAGE_INLINE_RE.match(query)
+    if m_img:
+        desc = m_img.group(1).strip()
+        price = ai_draw.image_price()
+        if len(desc) < 3:
+            await _answer_instruction(
+                update, "🎨 Rasm chizdirish — tasvirni yozing",
+                f"Masalan: rasm quyosh botayotgan dengiz • narxi: {ai_draw.fmt_sum(price)}",
+                query=query,
+            )
+            return
+        if not PUBLIC_BASE_URL:
+            await _answer_redirect(update, query, "PUBLIC_BASE_URL sozlanmagan")
+            return
+        result_id = str(uuid.uuid4())
+        cache[result_id] = {"type": "ai_image", "desc": desc[:500]}
+        await update.inline_query.answer(
+            [InlineQueryResultPhoto(
+                id=result_id,
+                photo_url=f"{PUBLIC_BASE_URL}/placeholder.png",
+                thumbnail_url=f"{PUBLIC_BASE_URL}/placeholder.png",
+                title=f"🎨 Rasm chizish — {ai_draw.fmt_sum(price)}" if price else "🎨 Rasm chizish",
+                description=desc[:120],
+                caption=f"⏳ Rasm chizilmoqda: {desc[:150]}",
+                reply_markup=INLINE_MESSAGE_MARKUP,
+            )],
+            cache_time=0, is_personal=True,
+        )
+        return
+
+    # --------------------------------------------------------
     # OG'IR: kurs ishi
     # --------------------------------------------------------
 
@@ -896,6 +1048,11 @@ async def on_chosen_inline_result(
         logger.info("📝 [CHOSEN_INLINE] test natijasi tanlandi — AI ga yuborilmaydi")
         return
 
+    # 📢 Reklama natijasi tanlanganda ham AI/edit oqimiga tushmaydi.
+    if chosen.result_id.startswith("ads_") or special_query.lower().startswith("ad:"):
+        logger.info("📢 [CHOSEN_INLINE] reklama natijasi yuborildi (user_id=%s)", getattr(chosen.from_user, "id", "?"))
+        return
+
     # 🎮 GAME ham og'ir/AI oqim emas: natija tanlanganda AI chaqirilmasin.
     # Cache restart bo'lsa ham query/result_id orqali aniqlanadi.
     if chosen.result_id.startswith("game_") or re.match(r"^game(?:\s+|$)", special_query, re.IGNORECASE):
@@ -965,6 +1122,10 @@ async def on_chosen_inline_result(
     # --------------------------------------------------------
     # 🎬 /vid
     # --------------------------------------------------------
+
+    if entry and entry.get("type") == "ai_image":
+        await _handle_ai_image(context, inline_message_id, entry.get("desc", ""), user)
+        return
 
     if entry and entry.get("type") == "vid":
         await _handle_vid(context, inline_message_id, entry["url"], user)
@@ -1286,6 +1447,66 @@ class _InlineCaptionStatus:
                 "Inline caption tahrirlashda xato "
                 f"(e'tiborsiz qoldirildi): {e}"
             )
+
+
+async def _handle_ai_image(context: ContextTypes.DEFAULT_TYPE, inline_message_id: str, desc: str, user=None):
+    """🎨 Inline AI rasm: pul band qilinadi → rasm chiziladi → xabar rasm bilan
+    almashtiriladi → pul yechiladi. Xatoda pul yechilmaydi."""
+    async def _fail(text: str):
+        try:
+            await context.bot.edit_message_caption(inline_message_id=inline_message_id, caption=text,
+                                                   reply_markup=INLINE_MESSAGE_MARKUP)
+        except Exception as e:
+            logger.error(f"🎨 Inline xato xabarini yozib bo'lmadi: {e}")
+
+    uid = getattr(user, "id", None)
+    if not uid:
+        await _fail("❌ Foydalanuvchi aniqlanmadi.")
+        return
+    hold = ai_draw.reserve(uid, ai_draw.IMAGE_FEATURE_ID, ai_draw.image_price())
+    if hold.status == "insufficient":
+        await _fail(f"❌ Balans yetarli emas: kerak {ai_draw.fmt_sum(hold.amount)}, mavjud {ai_draw.fmt_sum(hold.available)}. "
+                    f"Balansni to'ldirish: https://t.me/{BOT_USERNAME}")
+        _log_inline(user, f"rasm: {desc}", "error", "balans yetarli emas")
+        return
+    if hold.status == "disabled":
+        await _fail("🚫 Rasm chizdirish hozircha o'chirilgan.")
+        return
+
+    data = await ai_draw.draw_image(uid, desc)
+    if not data:
+        ai_draw.release(hold, "inline rasm chizilmadi")
+        await _fail("❌ Rasmni chizib bo'lmadi. Pul yechilmadi.")
+        _log_inline(user, f"rasm: {desc}", "error", "rasm chizilmadi")
+        return
+    path = None
+    try:
+        import os
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        url = inline_media.publish(path, "photo")
+        await context.bot.edit_message_media(
+            inline_message_id=inline_message_id,
+            media=InputMediaPhoto(media=url, caption=f"🎨 {desc[:200]}\n\n🤖 Talaba AI — @{BOT_USERNAME}"),
+            reply_markup=INLINE_MESSAGE_MARKUP,
+        )
+    except Exception as e:
+        logger.error(f"🎨 Inline rasmni joylashda xato: {type(e).__name__}: {e}", exc_info=True)
+        ai_draw.release(hold, "inline rasm joylanmadi")
+        await _fail("❌ Rasmni shu yerga joylab bo'lmadi. Pul yechilmadi.")
+        _log_inline(user, f"rasm: {desc}", "error", f"joylashda xato: {type(e).__name__}")
+        return
+    finally:
+        if path:
+            try:
+                import os
+                os.remove(path)
+            except OSError:
+                pass
+    ai_draw.commit(hold)
+    _log_inline(user, f"rasm: {desc}", "ok")
+
 
 
 async def _handle_course_work(

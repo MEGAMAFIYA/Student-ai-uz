@@ -17,6 +17,8 @@ asosiy matn handler.
 
 import asyncio
 import logging
+
+from cancel_registry import cancel_markup
 import re
 from io import BytesIO
 
@@ -28,7 +30,7 @@ from config import UNIVERSAL_CHAT_AI, TRANSLATE_AI
 from ai_clients import ask_ai
 from pdf_tools import build_course_work_pdf, count_pdf_pages
 from handlers.menu import main_menu_keyboard, MENU_CALLBACKS
-from handlers import course_work, mention_dispatch
+from handlers import course_work, mention_dispatch, ai_image
 from handlers.tabrik import tabrik_cmd
 from handlers.rasim import rasim_cmd
 from handlers.vid import vid_cmd
@@ -94,6 +96,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = update.effective_chat
+    user = update.effective_user
+    request_id = getattr(update, "update_id", None)
+    logger.info("MESSAGE_ROUTE_ENTER request_id=%s user_id=%s chat_id=%s chat_type=%s handler=universal_chat", request_id, getattr(user, "id", None), getattr(chat, "id", None), getattr(chat, "type", None))
+    # AL Yordamchi faol bo'lsa Universal Chat mutlaqo zaxira sifatida ham ishlamasin.
+    # Asosiy to'xtatish handlers/al_yordamchi.py group=-4 da; bu ikkinchi himoya.
+    if user and chat and chat.type == "private":
+        try:
+            import user_ai_keys
+            al_cfg = user_ai_keys.get_assistant_config(user.id)
+            if al_cfg.get("enabled"):
+                logger.warning("UNIVERSAL_CHAT_BLOCKED request_id=%s user_id=%s chat_id=%s reason=AL_PRIVATE_MODE_ACTIVE", request_id, user.id, chat.id)
+                return
+        except Exception:
+            logger.exception("UNIVERSAL_CHAT_BLOCKED request_id=%s user_id=%s reason=AL_STATE_CHECK_FAILED", request_id, getattr(user, "id", None))
+            return
+    # Universal AI faqat boshqa funksiya faol bo‘lmaganda ishlaydi.
+    # ConversationHandler xabarni ushlay olmagan holatda ham pastga tushib
+    # ketadigan matnlar shu markaziy tekshiruvda bloklanadi.
+    try:
+        import feature_guard
+        if user and feature_guard.is_user_busy(context.application, user.id):
+            logger.info("UNIVERSAL_AI_BLOCKED user_id=%s reason=ACTIVE_FEATURE", user.id)
+            return
+    except Exception:
+        logger.exception("Universal AI busy-guard tekshiruvida xato")
+        return  # xavfsiz tomoni: tekshiruv ishlamasa AI javob bermasin
+
     is_group = chat.type in ("group", "supergroup")
     user_text = update.message.text.strip()
 
@@ -128,10 +157,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     normalized_game = user_text.lower().replace("’", "'").replace("‘", "'")
     is_game_result = (
         ("1v1 o'yin xonasi tayyor" in normalized_game and
-         ("♟ shaxmat" in normalized_game or "⚪ rus shashkasi" in normalized_game))
-        or normalized_game.strip() in {"♟ shaxmat", "⚪ rus shashkasi"}
+         ("♟ shaxmat" in normalized_game or "⚪ rus shashkasi" in normalized_game or "🧠 xotira o'yini" in normalized_game or "❌⭕ x-o o'yini" in normalized_game))
+        or normalized_game.strip() in {"♟ shaxmat", "⚪ rus shashkasi", "🧠 xotira o'yini", "❌⭕ x-o o'yini"}
         or normalized_game.startswith("🎮 o'yinni boshlash")
     )
+    # 🧱 Quoridor: inline natija chatga tushganda (ayniqsa botning shaxsiy chatida) xabar
+    # "🧱 QUORIDOR 🏆 ..." matni bilan oddiy Message sifatida ham keladi — AI javob bermasin.
+    if normalized_game.startswith("🧱 quoridor"):
+        is_game_result = True
     if is_game_result:
         logger.info("🎮 Game xonasi xabari AI oqimidan o'tkazilmadi: chat_id=%s", chat.id)
         return
@@ -218,12 +251,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_text = stripped or user_text
 
     intent = detect_intent(user_text)
-    logger.info(f"💬 Universal chat xabari: chat_id={chat.id}, aniqlangan intent='{intent}'.")
+    logger.info("UNIVERSAL_CHAT_SELECTED request_id=%s user_id=%s chat_id=%s intent=%s ai=universal", request_id, getattr(user, "id", None), chat.id, intent)
 
     await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
 
     if intent == "course_work":
         await _try_course_work(update, context, user_text)
+        return
+
+    if intent == "chat" and ai_image.is_image_request(user_text):
+        await ai_image.ask_confirmation(update, context, user_text)
         return
 
     if intent == "translate":
@@ -242,6 +279,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _chat_with_history(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     history = context.chat_data.setdefault("history", [])
 
+    request_id = getattr(update, "update_id", None)
+    logger.info("UNIVERSAL_AI_REQUEST_START request_id=%s user_id=%s chat_id=%s provider=%s model=%s history_messages=%s", request_id, getattr(update.effective_user, "id", None), getattr(update.effective_chat, "id", None), getattr(UNIVERSAL_CHAT_AI, "provider", None), getattr(UNIVERSAL_CHAT_AI, "model", None), len(history))
     response = await ask_ai(
         UNIVERSAL_CHAT_AI,
         user_text,
@@ -252,10 +291,11 @@ async def _chat_with_history(update: Update, context: ContextTypes.DEFAULT_TYPE,
     )
 
     if not response:
-        logger.error(f"💬 Universal chat javob QAYTARMADI: chat_id={chat.id} — sababi yuqoridagi ai_clients loglarida.")
+        logger.error("UNIVERSAL_AI_REQUEST_FAILED request_id=%s user_id=%s chat_id=%s reason=EMPTY_RESPONSE", request_id, getattr(update.effective_user, "id", None), getattr(update.effective_chat, "id", None))
         await update.message.reply_text("❌ Hozircha javob berib bo'lmadi. Birozdan so'ng qayta urinib ko'ring.")
         return
 
+    logger.info("UNIVERSAL_AI_RESPONSE_RECEIVED request_id=%s user_id=%s chat_id=%s response_length=%s", request_id, getattr(update.effective_user, "id", None), getattr(update.effective_chat, "id", None), len(response))
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": response})
     max_items = MAX_HISTORY_TURNS * 2
@@ -287,8 +327,10 @@ async def _try_course_work(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         f"💬 Bu so'rovni *Kurs ishi* funksiyasiga yubordim.\n"
         f"⏳ *{topic}* mavzusida {pages}+ betlik kurs ishi tayyorlanmoqda...\nReja tuzilmoqda...",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_markup(),
     )
 
+    context.user_data["_student_feature_running"] = True
     try:
         result = await asyncio.wait_for(
             course_work.generate_course_work(topic, pages, status),
@@ -307,6 +349,7 @@ async def _try_course_work(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             "❌ Kurs ishini yaratib bo'lmadi — AI xizmatlari hozir javob bermayapti. "
             "Birozdan so'ng qayta urinib ko'ring."
         )
+        context.user_data.pop("_student_feature_running", None)
         return
 
     sections, pdf_buf, actual_pages = result
@@ -317,12 +360,13 @@ async def _try_course_work(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             f"📄 {topic}\n📎 {actual_pages} bet (so'ralgan: {pages}+)\n"
             "✅ Titul, mundarija, kirish, 3 bob, xulosa va adabiyotlar ro'yxati bilan."
         ),
-        reply_markup=main_menu_keyboard(),
     )
+    await update.message.reply_text("🏠 Bosh menyu:", reply_markup=main_menu_keyboard())
     try:
         await status.delete()
     except Exception:
         pass
+    context.user_data.pop("_student_feature_running", None)
 
 
 async def _try_translate(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
@@ -346,6 +390,7 @@ async def _try_translate(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     status = await update.message.reply_text(
         f"💬 Bu so'rovni *Tarjima* funksiyasiga yubordim.\n⏳ {target} tiliga tarjima qilinmoqda...",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_markup(),
     )
 
     system = (
